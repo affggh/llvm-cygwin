@@ -53,41 +53,74 @@ fetch_via_git() {
 
     local tmpdir
     tmpdir="$(mktemp -d)"
-    trap "rm -rf $tmpdir" EXIT
 
-    # Each repo is small (just .patch + .cygport + .hint files), ~100KB each
-    for pkg in llvm clang lld; do
+    # ------------------------------------------------------------------
+    # Main packages (their patches go directly into matching dirs)
+    # ------------------------------------------------------------------
+    for pkg in llvm clang lld compiler-rt; do
         info "Cloning cygwin-packages/$pkg.git ..."
         git clone --depth 1 "$CYGWIN_GIT/$pkg.git" "$tmpdir/$pkg" 2>&1 | tail -1
 
         local target="$PATCHES_DIR/$pkg"
         mkdir -p "$target"
 
-        # Copy all .patch files
         local count=0
         for f in "$tmpdir/$pkg"/*.patch; do
             [ -f "$f" ] || continue
             cp "$f" "$target/"
-            ((count++))
+            count=$((count + 1))
         done
         info "  $pkg: $count patches copied"
     done
 
-    # Separate runtime patches from LLVM patches
-    # libcxx/libcxxabi/libunwind/compiler-rt patches may be mixed in
-    for sub in libcxx libcxxabi libunwind compiler-rt; do
-        local subdir="$PATCHES_DIR/$sub"
-        mkdir -p "$subdir"
-        local subcount=0
-        for f in "$PATCHES_DIR/llvm"/*${sub}*.patch "$PATCHES_DIR/llvm"/*${sub^}*.patch; do
-            [ -f "$f" ] || continue
-            mv "$f" "$subdir/" 2>/dev/null && ((subcount++)) || true
-        done
-        [ "$subcount" -gt 0 ] && info "  $sub: $subcount patches moved from llvm/"
+    # ------------------------------------------------------------------
+    # libcxx repo — contains patches for libcxx, libcxxabi, and libunwind
+    # all mixed together.  Split by naming convention (from cygport):
+    #   0302-*, 0304-*, 0305-*, 0306-*  →  libcxx
+    #   0402-*, 0403-*, 0404-*          →  libcxxabi
+    #   20.1.2-*                        →  libunwind
+    #   (anything else falls through to libcxx)
+    # ------------------------------------------------------------------
+    info "Cloning cygwin-packages/libcxx.git ..."
+    git clone --depth 1 "$CYGWIN_GIT/libcxx.git" "$tmpdir/libcxx" 2>&1 | tail -1
+
+    for d in libcxx libcxxabi libunwind; do
+        mkdir -p "$PATCHES_DIR/$d"
     done
 
+    local counted_xx=0 counted_abi=0 counted_unwind=0
+    for f in "$tmpdir/libcxx"/*.patch; do
+        [ -f "$f" ] || continue
+        local base
+        base="$(basename "$f")"
+        case "$base" in
+            0402-*|0403-*|0404-*)
+                cp "$f" "$PATCHES_DIR/libcxxabi/"
+                counted_abi=$((counted_abi + 1))
+                ;;
+            20.1.2-*)
+                cp "$f" "$PATCHES_DIR/libunwind/"
+                counted_unwind=$((counted_unwind + 1))
+                ;;
+            *)
+                cp "$f" "$PATCHES_DIR/libcxx/"
+                counted_xx=$((counted_xx + 1))
+                ;;
+        esac
+    done
+    info "  libcxx: $counted_xx patches"
+    info "  libcxxabi: $counted_abi patches (from libcxx repo)"
+    info "  libunwind: $counted_unwind patches (from libcxx repo)"
+
+    rm -rf "$tmpdir"
+
     info "Patches fetched to $PATCHES_DIR/"
-    ls -la "$PATCHES_DIR"/{llvm,clang,lld,libcxx,libcxxabi,libunwind,compiler-rt}/ 2>/dev/null | grep -c '.patch' | xargs -I{} echo "  Total: {} patch files"
+    local total
+    total="$(find "$PATCHES_DIR/llvm" "$PATCHES_DIR/clang" "$PATCHES_DIR/lld" \
+        "$PATCHES_DIR/libcxx" "$PATCHES_DIR/libcxxabi" \
+        "$PATCHES_DIR/libunwind" "$PATCHES_DIR/compiler-rt" \
+        -maxdepth 1 -name '*.patch' -type f 2>/dev/null | wc -l)"
+    info "  Total: $total patch files"
 }
 
 # =============================================================================
@@ -100,7 +133,6 @@ fetch_via_srcpkg() {
     # Cygwin package versions (check setup.ini for current versions)
     local tmpdir
     tmpdir="$(mktemp -d)"
-    trap "rm -rf $tmpdir" EXIT
 
     download_and_extract() {
         local pkg="$1"
@@ -121,7 +153,7 @@ fetch_via_srcpkg() {
             local count=0
             while IFS= read -r -d '' f; do
                 cp "$f" "$target/"
-                ((count++))
+                count=$((count + 1))
             done < <(find "$tmpdir/$pkg" -name "*.patch" -print0 2>/dev/null)
             info "  $pkg: $count patches"
         else
@@ -134,6 +166,8 @@ fetch_via_srcpkg() {
     download_and_extract "llvm"   "$LLVM_VER"
     download_and_extract "clang"  "$LLVM_VER"
     download_and_extract "lld"    "$LLVM_VER"
+
+    rm -rf "$tmpdir"
 }
 
 # =============================================================================
