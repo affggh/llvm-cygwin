@@ -1,0 +1,35 @@
+# =============================================================================
+# llvm-cygwin .gitignore
+# =============================================================================
+
+# Build artifacts
+build/
+build-llvm-patched/
+build-libs/
+*.tar.xz
+*.tar.gz
+
+# Downloaded patches (fetched via scripts/fetch-patches.sh)
+patches/llvm/
+patches/clang/
+patches/lld/
+patches/libcxx/
+patches/libcxxabi/
+patches/libunwind/
+patches/compiler-rt/
+
+# Output
+toolchain/
+sysroot/
+*.exe
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Editor files
+*.swp
+*.swo
+*~
+.vscode/
+.idea/

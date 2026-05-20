@@ -1,0 +1,199 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: llvm-cygwin <dev@llvm-cygwin.local>
+Date: Mon, 19 May 2026 23:00:00 +0800
+Subject: [PATCH] Cygwin: Use lld directly for linking instead of delegating to g++
+
+Override buildLinker() to return a custom tools::cygwin::Linker that
+constructs ld.lld commands directly, like MinGW does.  This eliminates
+the need for a gcc/g++ shim in the toolchain.
+
+--- a/clang/lib/Driver/ToolChains/Cygwin.h
++++ b/clang/lib/Driver/ToolChains/Cygwin.h
+@@ -10,10 +10,34 @@
+ #define LLVM_CLANG_LIB_DRIVER_TOOLCHAINS_CYGWIN_H
+ 
+ #include "Gnu.h"
++#include "clang/Driver/Tool.h"
+ #include "clang/Driver/ToolChain.h"
++#include <string>
+ 
+ namespace clang {
+ namespace driver {
++namespace tools {
++namespace cygwin {
++
++class LLVM_LIBRARY_VISIBILITY Linker final : public Tool {
++public:
++  Linker(const ToolChain &TC, std::string GccLibDir, std::string SysRoot)
++    : Tool("Cygwin::Linker", "linker", TC),
++      GccLibDir(std::move(GccLibDir)), SysRoot(std::move(SysRoot)) {}
++  bool hasIntegratedCPP() const override { return false; }
++  bool isLinkJob() const override { return true; }
++  void ConstructJob(Compilation &C, const JobAction &JA,
++                    const InputInfo &Output, const InputInfoList &Inputs,
++                    const llvm::opt::ArgList &TCArgs,
++                    const char *LinkingOutput) const override;
++private:
++  std::string GccLibDir;
++  std::string SysRoot;
++};
++
++} // namespace cygwin
++} // namespace tools
++
+ namespace toolchains {
+ 
+ class LLVM_LIBRARY_VISIBILITY Cygwin : public Generic_GCC {
+@@ -21,6 +45,8 @@
+   Cygwin(const Driver &D, const llvm::Triple &Triple,
+          const llvm::opt::ArgList &Args);
+ 
++  Tool *buildLinker() const override;
++
+   llvm::ExceptionHandling
+   GetExceptionModel(const llvm::opt::ArgList &Args) const override;
+ 
+--- a/clang/lib/Driver/ToolChains/Cygwin.cpp
++++ b/clang/lib/Driver/ToolChains/Cygwin.cpp
+@@ -9,7 +9,9 @@
+ #include "Cygwin.h"
+ #include "CommonArgs.h"
+ #include "clang/Config/config.h"
++#include "clang/Driver/Compilation.h"
+ #include "clang/Driver/Driver.h"
++#include "clang/Driver/Job.h"
+ #include "clang/Driver/Options.h"
+ #include "llvm/Support/Path.h"
+ #include "llvm/Support/VirtualFileSystem.h"
+@@ -107,3 +109,131 @@
+   addExternCSystemInclude(DriverArgs, CC1Args, SysRoot + "/usr/include");
+   addExternCSystemInclude(DriverArgs, CC1Args, SysRoot + "/usr/include/w32api");
+ }
++
++Tool *Cygwin::buildLinker() const {
++  return new tools::cygwin::Linker(*this,
++                                   std::string(GCCInstallation.getInstallPath()),
++                                   computeSysRoot());
++}
++
++void tools::cygwin::Linker::ConstructJob(
++    Compilation &C, const JobAction &JA, const InputInfo &Output,
++    const InputInfoList &Inputs, const ArgList &Args,
++    const char * /*LinkingOutput*/) const {
++  const Driver &D = getToolChain().getDriver();
++
++  ArgStringList CmdArgs;
++
++  // Claim flags we don't need to forward to the linker
++  Args.ClaimAllArgs(options::OPT_g_Group);
++  Args.ClaimAllArgs(options::OPT_emit_llvm);
++  Args.ClaimAllArgs(options::OPT_w);
++
++  // Sysroot
++  if (!D.SysRoot.empty())
++    CmdArgs.push_back(Args.MakeArgString("--sysroot=" + D.SysRoot));
++
++  // Strip debug info
++  if (Args.hasArg(options::OPT_s))
++    CmdArgs.push_back("-s");
++
++  // PE machine type
++  CmdArgs.push_back("-m");
++  switch (getToolChain().getArch()) {
++  case llvm::Triple::x86_64:
++    CmdArgs.push_back("i386pep"); break;
++  case llvm::Triple::x86:
++    CmdArgs.push_back("i386pe"); break;
++  default:
++    D.Diag(diag::err_target_unknown_triple) << getToolChain().getTriple().str();
++    return;
++  }
++
++  // Subsystem: -mwindows / -mconsole
++  if (Arg *A = Args.getLastArg(options::OPT_mwindows, options::OPT_mconsole)) {
++    CmdArgs.push_back("--subsystem");
++    CmdArgs.push_back(A->getOption().matches(options::OPT_mwindows)
++                          ? "windows" : "console");
++  }
++
++  if (Args.hasArg(options::OPT_mdll))
++    CmdArgs.push_back("--dll");
++  else if (Args.hasArg(options::OPT_shared))
++    CmdArgs.push_back("--shared");
++
++  bool IsStatic = Args.hasArg(options::OPT_static);
++  CmdArgs.push_back(IsStatic ? "-Bstatic" : "-Bdynamic");
++
++  if (Args.hasArg(options::OPT_mdll) || Args.hasArg(options::OPT_shared)) {
++    CmdArgs.push_back("-e");
++    CmdArgs.push_back("DllMainCRTStartup");
++    CmdArgs.push_back("--enable-auto-image-base");
++  }
++
++  // Output with .exe extension
++  CmdArgs.push_back("-o");
++  const char *OutFile = Output.getFilename();
++  if (!llvm::sys::path::has_extension(OutFile))
++    CmdArgs.push_back(Args.MakeArgString(llvm::Twine(OutFile) + ".exe"));
++  else
++    CmdArgs.push_back(OutFile);
++
++  auto AddGccFile = [&](const char *Name) {
++    llvm::SmallString<128> P(GccLibDir);
++    llvm::sys::path::append(P, Name);
++    CmdArgs.push_back(Args.MakeArgString(P));
++  };
++
++  // CRT startup files
++  if (!Args.hasArg(options::OPT_nostdlib, options::OPT_nostartfiles)) {
++    if (!(Args.hasArg(options::OPT_shared) || Args.hasArg(options::OPT_mdll)))
++      CmdArgs.push_back(Args.MakeArgString(SysRoot + "/usr/lib/crt0.o"));
++    AddGccFile("crtbegin.o");
++  }
++
++  // Library search paths
++  Args.AddAllArgs(CmdArgs, options::OPT_L);
++  CmdArgs.push_back(Args.MakeArgString("-L" + SysRoot + "/usr/lib"));
++  CmdArgs.push_back(Args.MakeArgString("-L" + SysRoot + "/usr/lib/w32api"));
++  CmdArgs.push_back(Args.MakeArgString("-L" + GccLibDir));
++
++  // Input object files and libraries
++  AddLinkerInputs(getToolChain(), Inputs, Args, CmdArgs, JA);
++
++  // C++ standard library
++  if (getToolChain().ShouldLinkCXXStdlib(Args)) {
++    ToolChain::CXXStdlibType Type = getToolChain().GetCXXStdlibType(Args);
++    if (Type == ToolChain::CST_Libcxx) {
++      CmdArgs.push_back("-lc++");
++      CmdArgs.push_back("-lc++abi");
++      CmdArgs.push_back("-lunwind");
++    } else {
++      CmdArgs.push_back("-lstdc++");
++    }
++  }
++
++  // Standard libraries
++  if (!Args.hasArg(options::OPT_nostdlib, options::OPT_nodefaultlibs)) {
++    AddGccFile("libgcc_eh.a");
++    AddGccFile("libgcc.a");
++    CmdArgs.push_back("-lcygwin");
++    CmdArgs.push_back("-lkernel32");
++    CmdArgs.push_back("-luser32");
++    CmdArgs.push_back("-ladvapi32");
++    CmdArgs.push_back("-lshell32");
++    if (IsStatic) {
++      CmdArgs.push_back("-lintl");
++      CmdArgs.push_back("-liconv");
++      CmdArgs.push_back("-lcharset");
++    }
++  }
++
++  // CRT end file
++  if (!Args.hasArg(options::OPT_nostdlib, options::OPT_nostartfiles))
++    AddGccFile("crtend.o");
++
++  const char *Exec = Args.MakeArgString(getToolChain().GetLinkerPath());
++  C.addCommand(std::make_unique<Command>(JA, *this,
++                                         ResponseFileSupport::AtFileUTF8(),
++                                         Exec, CmdArgs, Inputs, Output));
++}

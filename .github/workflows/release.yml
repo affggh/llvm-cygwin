@@ -1,0 +1,116 @@
+# =============================================================================
+# llvm-cygwin Release CI
+# =============================================================================
+# Builds the full cross-compiler toolchain on ubuntu-latest and publishes
+# the package as a GitHub Release when a tag like v1.0.0 is pushed.
+# =============================================================================
+
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag (e.g. v1.0.0)'
+        required: false
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build llvm-cygwin
+    runs-on: ubuntu-latest
+    env:
+      # No local proxy in CI — direct downloads
+      PROXY: ""
+      JOBS: "4"
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          path: llvm-cygwin
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq \
+            cmake \
+            ninja-build \
+            git \
+            wget \
+            gcc \
+            g++ \
+            xz-utils \
+            zstd \
+            bzip2 \
+            pkg-config \
+            libxml2-dev \
+            python3
+          echo "=== Tool versions ==="
+          cmake --version | head -1
+          ninja --version
+          git --version
+          gcc --version | head -1
+          python3 --version
+
+      - name: Download Cygwin patches
+        working-directory: llvm-cygwin
+        run: bash scripts/fetch-patches.sh
+
+      - name: Download Cygwin sysroot
+        working-directory: llvm-cygwin
+        run: bash scripts/fetch-sysroot.sh
+
+      - name: Build toolchain
+        working-directory: llvm-cygwin
+        run: bash build.sh
+
+      - name: Smoke test
+        working-directory: llvm-cygwin
+        run: |
+          echo '#include <cstdio>' > test.cpp
+          echo 'int main() { printf("Hello from llvm-cygwin!\\n"); return 0; }' >> test.cpp
+          export PATH="$PWD/toolchain/bin:$PATH"
+          x86_64-pc-cygwin-clang++ -static test.cpp -o test.exe
+          file test.exe
+          echo "=== Smoke test passed ==="
+          rm -f test.cpp test.exe
+
+      - name: Upload package artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: llvm-cygwin-package
+          path: llvm-cygwin/llvm-cygwin-*.tar.xz
+          retention-days: 7
+
+      - name: Create Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: "llvm-cygwin ${{ github.ref_name }}"
+          body: |
+            ## llvm-cygwin ${{ github.ref_name }}
+
+            Pure-LLVM cross-compiler for **Linux → Cygwin/Windows PE** targets.
+
+            ### Included
+            - Clang/LLD/libc++/libc++abi/libunwind (LLVM 20.1.8)
+            - Cygwin sysroot (headers, libraries, w32api, libiconv, libintl)
+
+            ### Usage
+            ```bash
+            tar -xJf llvm-cygwin-*.tar.xz
+            cd llvm-cygwin-*/
+            source env.sh
+            x86_64-pc-cygwin-clang++ -static hello.cpp -o hello.exe
+            ```
+          files: llvm-cygwin/llvm-cygwin-*.tar.xz
+          fail_on_unmatched_files: false
+          generate_release_notes: false
