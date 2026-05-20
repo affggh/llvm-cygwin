@@ -51,7 +51,7 @@ jobs:
             bzip2 \
             pkg-config \
             libxml2-dev \
-            python3
+            python3 clang llvm lld
           echo "=== Tool versions ==="
           cmake --version | head -1
           ninja --version
