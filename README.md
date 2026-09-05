@@ -42,8 +42,14 @@ llvm-cygwin/
 ### 3. 构建工具链
 
 ```bash
-./build.sh
+./build.sh                # 构建 + 打包
+./build.sh --build-only   # 只构建，不打包
+./build.sh --clean        # 强制重新 configure（保留源码与补丁）
 ```
+
+`build.sh` **支持断点续建**：再次运行时不会删除已有的 `build/llvm-project`、
+`build/llvm-build`、`build/runtime-build`，而是直接 `ninja` 增量续建，几分钟即可
+继续。只有主动传 `--clean` 或删除相应目录才会重新 configure。
 
 构建完成后，工具链在 `toolchain/`，sysroot 在 `sysroot/`。
 
@@ -66,7 +72,7 @@ wine-cygwin hello.exe
 
 | 变量 | 默认值 | 说明 |
 |---|---|---|
-| `JOBS` | `nproc` | 并行编译任务数 |
+| `JOBS` | `min(nproc, 8)` | 并行编译任务数；WSL/内存受限主机默认封顶 8，可用 `JOBS=16` 覆盖 |
 | `PROXY` | `http://127.0.0.1:7897` | HTTP 代理 |
 | `CYGWIN_MIRROR` | `mirrors.kernel.org` | Cygwin 镜像地址 |
 | `SKIP_CLONE` | 空 | 设为 1 跳过 LLVM clone（开发用） |

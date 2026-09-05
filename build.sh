@@ -3,9 +3,15 @@
 # build.sh — All-in-one build script for llvm-cygwin cross-compiler toolchain
 # =============================================================================
 # Usage:
-#   ./build.sh                    # Full build + package
+#   ./build.sh                    # Build (resumes where it left off) + package
 #   ./build.sh --build-only       # Build only, don't package
 #   ./build.sh --package-only     # Package existing toolchain
+#   ./build.sh --clean            # Force a clean reconfigure of build dirs
+#
+# The script is RESUME-friendly: existing build/llvm-project, build/llvm-build
+# and build/runtime-build directories are reused and ninja only rebuilds what
+# actually changed, so an interrupted build can simply be continued by running
+# ./build.sh again. Use --clean to force a full reconfigure from scratch.
 #
 # Quick start (first time):
 #   1. ./scripts/fetch-patches.sh
@@ -13,7 +19,7 @@
 #   3. ./build.sh
 #
 # Environment:
-#   JOBS         Parallel build jobs (default: nproc)
+#   JOBS         Parallel build jobs (default: min(nproc, 8); WSL-safe)
 #   PROXY        HTTP proxy (default: http://127.0.0.1:7897)
 #   SKIP_CLONE   Skip LLVM clone step (for dev iteration)
 # =============================================================================
@@ -27,10 +33,15 @@ PATCH_DIR="$PROJECT_DIR/patches"
 INSTALL_PREFIX="$PROJECT_DIR/toolchain"
 SYSROOT="$PROJECT_DIR/sysroot"
 BUILD_DIR="$PROJECT_DIR/build"
-JOBS="${JOBS:-$(nproc)}"
-LLVM_VERSION="20.1.8"
+# Cap the default parallelism at 8 so WSL / memory-limited hosts don't OOM.
+# Override on beefy hosts with JOBS=N, e.g.  JOBS=32 ./build.sh
+NPROC="$(nproc 2>/dev/null || echo 4)"
+DEFAULT_JOBS=8
+[ "$NPROC" -lt "$DEFAULT_JOBS" ] && DEFAULT_JOBS="$NPROC"
+JOBS="${JOBS:-$DEFAULT_JOBS}"
+LLVM_VERSION="22.1.8"
 # PROXY: set to empty string to disable (e.g. in CI)
-PROXY="${PROXY-http://127.0.0.1:7897}"
+PROXY=""
 
 TRIPLE="x86_64-pc-cygwin"
 GCCVER=13
@@ -71,18 +82,16 @@ check_prereqs() {
 # Clone LLVM
 # =============================================================================
 clone_llvm() {
-    step "Step 1: Clone LLVM ${LLVM_VERSION}"
+    step "Step 1: LLVM source (${LLVM_VERSION})"
 
     mkdir -p "$BUILD_DIR"
     cd "$BUILD_DIR"
 
     if [ -d llvm-project ]; then
-        if [ "${SKIP_CLONE:-0}" = "1" ]; then
-            info "SKIP_CLONE=1, using existing llvm-project"
-            return
-        fi
-        info "Removing existing llvm-project..."
-        rm -rf llvm-project
+        # Resume-friendly: reuse an existing checkout. Delete it manually
+        # (rm -rf build/llvm-project) to force a fresh clone.
+        info "Using existing llvm-project (delete it to force a fresh clone)"
+        return
     fi
 
     if [ -n "$PROXY" ]; then
@@ -99,119 +108,115 @@ clone_llvm() {
 # =============================================================================
 # Apply patches
 # =============================================================================
+# Cygwin patches are exported from source tarballs and therefore carry many
+# different path prefixes (a/..., origsrc/llvm-X.src/..., origsrc/libcxx-X.src/...,
+# origsrc/libcxxabi-X.src/..., origsrc/llvm-project-X.src/..., origsrc/runtimes/...).
+# They can also target any directory of the monorepo — llvm, clang, lld,
+# libcxx, libcxxabi, libunwind, compiler-rt AND runtimes/ (e.g. the
+# runtimes-newlib-libc.patch that fixes HandleLibC.cmake).
+#
+# So instead of assuming a fixed base dir / strip level, each patch is tried
+# against every candidate directory × strip level and is applied wherever a
+# clean dry-run succeeds. Patches that are already applied or that don't match
+# this LLVM version are skipped, which makes this step idempotent.
+# =============================================================================
 apply_patches() {
     step "Step 2: Apply Patches"
 
-    cd "$BUILD_DIR/llvm-project"
+    local LLVM_SRC="$BUILD_DIR/llvm-project"
+    cd "$LLVM_SRC"
 
-    apply_patch_dir() {
-        local dir="$1"
-        local label="$2"
-        local patch_d="$PATCH_DIR/$dir"
-
-        if [ ! -d "$patch_d" ] || [ -z "$(ls -A "$patch_d"/*.patch 2>/dev/null)" ]; then
-            info "No ${label} patches found, skipping"
-            return
+    # Fast resume path: if no patch file is newer than the last successful run,
+    # assume the tree is already patched and do not re-scan everything.
+    local stamp="$BUILD_DIR/.patches-applied"
+    if [ -f "$stamp" ]; then
+        if ! find "$PATCH_DIR" -name '*.patch' -newer "$stamp" -print -quit 2>/dev/null | grep -q .; then
+            info "Patches already applied (stamp $stamp); skipping"
+            return 0
         fi
+        info "Patch files changed since last apply; re-applying (idempotent)..."
+    fi
 
-        info "Applying ${label} patches..."
-        for patch in "$patch_d"/*.patch; do
-            local pname
-            pname="$(basename "$patch")"
-            echo -n "    $pname ... "
-            if patch -p1 -N --batch --dry-run < "$patch" 2>/dev/null; then
-                patch -p1 -N --batch < "$patch" >/dev/null 2>&1
-                echo "OK"
-            elif patch -p2 -N --batch --dry-run < "$patch" 2>/dev/null; then
-                patch -p2 -N --batch < "$patch" >/dev/null 2>&1
-                echo "OK (p2)"
-            else
-                echo "skipped (already applied)"
-            fi
+    # Candidate base directories: the monorepo root first (covers a/… git-style
+    # patches), then each project directory the Cygwin patches may touch.
+    local bases=("$LLVM_SRC")
+    local sub
+    for sub in llvm clang lld libcxx libcxxabi libunwind compiler-rt runtimes cmake utils; do
+        [ -d "$LLVM_SRC/$sub" ] && bases+=("$LLVM_SRC/$sub")
+    done
+
+    local total=0 applied=0 skipped=0
+    local patch
+    while IFS= read -r -d '' patch; do
+        local pname base_dir p ok=0
+        pname="$(basename "$patch")"
+        total=$((total + 1))
+
+        for base_dir in "${bases[@]}"; do
+            for p in 1 2 3 4; do
+                if ( cd "$base_dir" && patch -p"$p" -N --batch --dry-run < "$patch" >/dev/null 2>&1 ); then
+                    if ( cd "$base_dir" && patch -p"$p" -N --batch --no-backup-if-mismatch < "$patch" >/dev/null 2>&1 ); then
+                        echo "    $pname -> OK  (-p$p in $(basename "$base_dir"))"
+                        applied=$((applied + 1))
+                        ok=1
+                        break 2
+                    fi
+                fi
+            done
         done
-    }
 
-    # Main patches (from Cygwin official repos, fetched via fetch-patches.sh)
-    apply_patch_dir "llvm" "LLVM"
-    apply_patch_dir "clang" "Clang"
-    apply_patch_dir "lld"  "LLD"
-
-    # Subproject patches — need to apply from within the subdirectory
-    # because Cygwin patches use origsrc/libunwind-X.Y.Z.src/src/... paths
-    # that map to subdir/src/... when -p2 is applied inside the subdir.
-    apply_subdir_patch() {
-        local subdir="$1"
-        local label="$2"
-        local patch_d="$PATCH_DIR/$subdir"
-
-        if [ ! -d "$patch_d" ] || [ -z "$(ls -A "$patch_d"/*.patch 2>/dev/null)" ]; then
-            info "No ${label} patches found, skipping"
-            return
+        if [ "$ok" -eq 0 ]; then
+            echo "    $pname -> skipped (already applied or does not match LLVM ${LLVM_VERSION})"
+            skipped=$((skipped + 1))
         fi
+    done < <(find "$PATCH_DIR" -name '*.patch' -print0 2>/dev/null)
 
-        if [ ! -d "$BUILD_DIR/llvm-project/$subdir" ]; then
-            info "${label} subdirectory not found, skipping"
-            return
-        fi
+    echo ""
+    info "Patches: $total total, $applied applied, $skipped skipped"
 
-        info "Applying ${label} patches..."
-        pushd "$BUILD_DIR/llvm-project/$subdir" > /dev/null
-        for patch in "$patch_d"/*.patch; do
-            local pname
-            pname="$(basename "$patch")"
-            echo -n "    $pname ... "
-            if patch -p2 -N --batch --dry-run < "$patch" 2>/dev/null; then
-                patch -p2 -N --batch < "$patch" >/dev/null 2>&1
-                echo "OK"
-            elif patch -p1 -N --batch --dry-run < "$patch" 2>/dev/null; then
-                patch -p1 -N --batch < "$patch" >/dev/null 2>&1
-                echo "OK (p1)"
-            else
-                echo "skipped"
-            fi
-        done
-        popd > /dev/null
-    }
-
-    apply_subdir_patch "libunwind" "libunwind"
-    apply_subdir_patch "libcxxabi" "libcxxabi"
-    apply_subdir_patch "libcxx"    "libcxx"
-    apply_subdir_patch "compiler-rt" "compiler-rt"
-
-    # Our custom patches (e.g. direct lld linker)
-    apply_patch_dir "custom" "Custom"
+    # Only stamp if at least the tree is in a usable (patched or clean) state.
+    if [ "$applied" -gt 0 ] || [ -f "$stamp" ]; then
+        : > "$stamp"
+    fi
 }
 
 # =============================================================================
 # Build LLVM/Clang/LLD
 # =============================================================================
 build_llvm() {
-    step "Step 3: Configure LLVM"
+    step "Step 3: Configure LLVM (if needed)"
 
     cd "$BUILD_DIR"
-    rm -rf llvm-build
 
-    cmake -G Ninja \
-        -S llvm-project/llvm \
-        -B llvm-build \
-        -DCMAKE_BUILD_TYPE=Release \
-        -DLLVM_ENABLE_PROJECTS="clang;lld" \
-        -DLLVM_TARGETS_TO_BUILD=X86 \
-        -DCMAKE_INSTALL_PREFIX="$INSTALL_PREFIX" \
-        -DLLVM_INSTALL_TOOLCHAIN_ONLY=ON \
-        -DLLVM_ENABLE_ASSERTIONS=OFF \
-        -DLLVM_OPTIMIZED_TABLEGEN=ON \
-        -DLLVM_DEFAULT_TARGET_TRIPLE=x86_64-pc-windows-cygnus \
-        -DDEFAULT_SYSROOT="$SYSROOT" \
-        -DLLVM_ENABLE_THREADS=ON \
-        -DLLVM_ENABLE_LLD=ON \
-        -DCLANG_DEFAULT_LINKER=lld
+    if [ -f llvm-build/CMakeCache.txt ] && [ "$FORCE_RECONF" -eq 0 ]; then
+        info "llvm-build already configured; resuming (use --clean to reconfigure)"
+    else
+        if [ "$FORCE_RECONF" -eq 1 ]; then
+            info "--clean: wiping llvm-build for a fresh configure"
+        fi
+        rm -rf llvm-build "$INSTALL_PREFIX"
+
+        cmake -G Ninja \
+            -S llvm-project/llvm \
+            -B llvm-build \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DLLVM_ENABLE_PROJECTS="clang;lld" \
+            -DLLVM_TARGETS_TO_BUILD=X86 \
+            -DCMAKE_INSTALL_PREFIX="$INSTALL_PREFIX" \
+            -DLLVM_INSTALL_TOOLCHAIN_ONLY=ON \
+            -DLLVM_ENABLE_ASSERTIONS=OFF \
+            -DLLVM_OPTIMIZED_TABLEGEN=ON \
+            -DLLVM_DEFAULT_TARGET_TRIPLE=x86_64-pc-windows-cygnus \
+            -DDEFAULT_SYSROOT="$SYSROOT" \
+            -DLLVM_ENABLE_THREADS=ON \
+            -DLLVM_ENABLE_LLD=ON \
+            -DCLANG_DEFAULT_LINKER=lld
+    fi
 
     step "Step 4: Build LLVM (${JOBS} jobs)"
     ninja -C llvm-build -j"$JOBS"
 
     step "Step 5: Install to $INSTALL_PREFIX"
-    rm -rf "$INSTALL_PREFIX"
     ninja -C llvm-build install
 }
 
@@ -222,7 +227,24 @@ build_runtimes() {
     step "Step 6: Build libc++ + libc++abi + libunwind for Cygwin"
 
     local RT_BUILD="$BUILD_DIR/runtime-build"
-    rm -rf "$RT_BUILD"
+    local RT_CONF_OK=0
+
+    # Resume-friendly configure: only (re)configure when needed. Cygwin needs
+    # RUNTIMES_USE_LIBC=newlib so libc++ takes the newlib ctype rune table in
+    # <__locale>; if an older cache lacks this we reconfigure it in place
+    # (object files are kept, so this is cheap).
+    if [ -f "$RT_BUILD/CMakeCache.txt" ]; then
+        if grep -q '^RUNTIMES_USE_LIBC:STRING=newlib$' "$RT_BUILD/CMakeCache.txt"; then
+            RT_CONF_OK=1
+        else
+            info "runtime-build cache lacks RUNTIMES_USE_LIBC=newlib; reconfiguring in place..."
+        fi
+    fi
+    if [ "$FORCE_RECONF" -eq 1 ]; then
+        info "--clean: wiping runtime-build for a fresh configure"
+        rm -rf "$RT_BUILD"
+        RT_CONF_OK=0
+    fi
 
     cat > "$BUILD_DIR/toolchain-cygwin.cmake" << 'TCEOF'
 set(CMAKE_SYSTEM_NAME Cygwin)
@@ -254,29 +276,35 @@ TCEOF
     sed -i "s|@CXX@|$INSTALL_PREFIX/bin/clang++|g"   "$BUILD_DIR/toolchain-cygwin.cmake"
     sed -i "s|@SYSROOT@|$SYSROOT|g"                  "$BUILD_DIR/toolchain-cygwin.cmake"
 
-    cmake -G Ninja \
-        -S "$BUILD_DIR/llvm-project/runtimes" \
-        -B "$RT_BUILD" \
-        -DCMAKE_TOOLCHAIN_FILE="$BUILD_DIR/toolchain-cygwin.cmake" \
-        -DCMAKE_BUILD_TYPE=Release \
-        -DCMAKE_INSTALL_PREFIX="$SYSROOT/usr" \
-        -DLLVM_ENABLE_RUNTIMES="libcxx;libcxxabi;libunwind" \
-        -DLLVM_DEFAULT_TARGET_TRIPLE="$TRIPLE" \
-        -DLIBCXX_ENABLE_STATIC=ON \
-        -DLIBCXX_ENABLE_SHARED=OFF \
-        -DLIBCXX_ENABLE_STATIC_ABI_LIBRARY=ON \
-        -DLIBCXXABI_ENABLE_STATIC=ON \
-        -DLIBCXXABI_ENABLE_SHARED=OFF \
-        -DLIBUNWIND_ENABLE_STATIC=ON \
-        -DLIBUNWIND_ENABLE_SHARED=OFF \
-        -DLIBCXX_CXX_ABI=libcxxabi \
-        -DLIBCXXABI_USE_LLVM_UNWINDER=ON \
-        -DLIBCXX_USE_COMPILER_RT=OFF \
-        -DLIBCXXABI_USE_COMPILER_RT=OFF \
-        -DLIBUNWIND_USE_COMPILER_RT=OFF \
-        -DLIBCXX_INCLUDE_BENCHMARKS=OFF \
-        -DLIBCXX_ENABLE_ABI_LINKER_SCRIPT=OFF \
-        -DLIBCXX_HAS_ATOMIC_LIB=OFF
+    if [ "$RT_CONF_OK" -eq 0 ]; then
+        info "Configuring runtime build..."
+        cmake -G Ninja \
+            -S "$BUILD_DIR/llvm-project/runtimes" \
+            -B "$RT_BUILD" \
+            -DCMAKE_TOOLCHAIN_FILE="$BUILD_DIR/toolchain-cygwin.cmake" \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_INSTALL_PREFIX="$SYSROOT/usr" \
+            -DLLVM_ENABLE_RUNTIMES="libcxx;libcxxabi;libunwind" \
+            -DLLVM_DEFAULT_TARGET_TRIPLE="$TRIPLE" \
+            -DRUNTIMES_USE_LIBC=newlib \
+            -DLIBCXX_ENABLE_STATIC=ON \
+            -DLIBCXX_ENABLE_SHARED=OFF \
+            -DLIBCXX_ENABLE_STATIC_ABI_LIBRARY=ON \
+            -DLIBCXXABI_ENABLE_STATIC=ON \
+            -DLIBCXXABI_ENABLE_SHARED=OFF \
+            -DLIBUNWIND_ENABLE_STATIC=ON \
+            -DLIBUNWIND_ENABLE_SHARED=OFF \
+            -DLIBCXX_CXX_ABI=libcxxabi \
+            -DLIBCXXABI_USE_LLVM_UNWINDER=ON \
+            -DLIBCXX_USE_COMPILER_RT=OFF \
+            -DLIBCXXABI_USE_COMPILER_RT=OFF \
+            -DLIBUNWIND_USE_COMPILER_RT=OFF \
+            -DLIBCXX_INCLUDE_BENCHMARKS=OFF \
+            -DLIBCXX_ENABLE_ABI_LINKER_SCRIPT=OFF \
+            -DLIBCXX_HAS_ATOMIC_LIB=OFF
+    else
+        info "runtime-build already configured correctly; resuming"
+    fi
 
     ninja -C "$RT_BUILD" -j"$JOBS" cxx cxxabi unwind
     ninja -C "$RT_BUILD" install
@@ -316,9 +344,13 @@ LDDEOF
 
     # --- cfg file for auto-detection ---
     # Placed alongside clang; auto-loaded when x86_64-pc-cygwin-clang runs.
+    # NOTE: do NOT set --unwindlib=libunwind here — clang's driver rejects
+    # unwindlib=libunwind while rtlib defaults to libgcc (Cygwin), and this
+    # toolchain does not build compiler-rt. Cygwin's static libgcc.a (kept in
+    # the sysroot) provides the runtime/unwind symbols; ld.lld links it without
+    # needing the gcc driver.
     cat > "$BIN/x86_64-pc-windows-cygnus.cfg" << 'CFGEOF'
 --stdlib=libc++
---unwindlib=libunwind
 -fuse-ld=lld
 CFGEOF
 
@@ -425,21 +457,28 @@ ENVEOF
 # =============================================================================
 DO_BUILD=1
 DO_PACKAGE=1
+FORCE_RECONF=0
 for arg in "$@"; do
     case "$arg" in
         --build-only)   DO_PACKAGE=0 ;;
         --package-only) DO_BUILD=0 ;;
+        --clean|--force) FORCE_RECONF=1 ;;
         --help|-h)
             echo "Usage: $0 [options]"
             echo ""
             echo "Options:"
             echo "  --build-only     Build toolchain, skip packaging"
             echo "  --package-only   Package existing toolchain"
+            echo "  --clean, --force Force a clean reconfigure of the build dirs"
+            echo "                    (existing source clone is kept)"
+            echo ""
+            echo "The script resumes incremental builds by default; no need to"
+            echo "re-run everything from scratch after an interruption."
             echo ""
             echo "Environment:"
-            echo "  JOBS             Parallel jobs (default: nproc)"
+            echo "  JOBS             Parallel jobs (default: min(nproc,8))"
             echo "  PROXY            HTTP proxy (default: http://127.0.0.1:7897)"
-            echo "  SKIP_CLONE=1     Skip LLVM clone step"
+            echo "  SKIP_CLONE=1     Skip LLVM clone step (for dev iteration)"
             exit 0
             ;;
     esac
