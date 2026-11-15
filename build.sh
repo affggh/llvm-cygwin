@@ -253,6 +253,83 @@ build_llvm() {
 }
 
 # =============================================================================
+# Install compiler-rt's static builtins next to the resource dir
+# =============================================================================
+# clang looks for <resource-dir>/lib/<triple>/libclang_rt.builtins.a when
+# --rtlib=compiler-rt is used (that is the default in llvm-mingw, and it is
+# required before --unwindlib=libunwind is accepted: the driver rejects
+# "libunwind" while rtlib is libgcc).
+#
+# compiler-rt treats Cygwin like Windows: __emutls_* and ___chkstk_ms are
+# expected from cygwin1.dll/libgcc on a native build and are therefore missing
+# from the static archive, and the "shared builtins" DLL target cannot be built
+# by a cross toolchain (it wants -Wl,-z,defs). So only the static archive is
+# used, with those two objects appended.
+build_compiler_rt() {
+    step "Step 6b: Build compiler-rt builtins for --rtlib=compiler-rt"
+
+    local CRT_BUILD="$BUILD_DIR/compiler-rt-build"
+    local ARCH="${TRIPLE%%-*}"
+    # The driver looks in <resource-dir>/lib/<normalized triple>/; Cygwin's
+    # triple normalizes to <arch>-pc-windows-cygnus.
+    local CRT_DIR="$INSTALL_PREFIX/lib/clang/${LLVM_VERSION%%.*}/lib/${ARCH}-pc-windows-cygnus"
+    local archive="$CRT_BUILD/lib/cygwin/libclang_rt.builtins-static-$ARCH.a"
+
+    # A standalone build, not the runtimes bootstrap: Cygwin's compiler-rt patch
+    # also defines a "shared builtins" DLL (builtins come from cygwin1.dll on a
+    # native build) which needs -Wl,-z,defs and therefore cannot be linked by
+    # ld.lld's COFF driver. Building just the static archive sidesteps it.
+    if [ ! -f "$CRT_BUILD/CMakeCache.txt" ] ||
+       ! grep -qxF "CMAKE_SYSROOT:PATH=$SYSROOT" "$CRT_BUILD/CMakeCache.txt"; then
+        rm -rf "$CRT_BUILD"
+        info "Configuring compiler-rt..."
+        cmake -G Ninja \
+            -S "$BUILD_DIR/llvm-project/compiler-rt" \
+            -B "$CRT_BUILD" \
+            -DCMAKE_TOOLCHAIN_FILE="$BUILD_DIR/toolchain-cygwin.cmake" \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_C_COMPILER="$INSTALL_PREFIX/bin/clang" \
+            -DCMAKE_CXX_COMPILER="$INSTALL_PREFIX/bin/clang++" \
+            -DCOMPILER_RT_DEFAULT_TARGET_ONLY=ON \
+            -DCOMPILER_RT_BUILD_BUILTINS=ON \
+            -DCOMPILER_RT_BUILD_SANITIZERS=OFF \
+            -DCOMPILER_RT_BUILD_PROFILE=OFF \
+            -DCOMPILER_RT_BUILD_XRAY=OFF \
+            -DCOMPILER_RT_BUILD_LIBFUZZER=OFF \
+            -DCOMPILER_RT_BUILD_MEMPROF=OFF \
+            -DCOMPILER_RT_BUILD_ORC=OFF \
+            -DCOMPILER_RT_BUILD_CTX_PROFILE=OFF \
+            > "$BUILD_DIR/compiler-rt-configure.log" 2>&1 ||
+            { err "compiler-rt configure failed (see $BUILD_DIR/compiler-rt-configure.log)"; return 1; }
+    fi
+
+    ninja -C "$CRT_BUILD" -j"$JOBS" "libclang_rt.builtins-static-$ARCH.a" \
+        > "$BUILD_DIR/compiler-rt-build.log" 2>&1 ||
+        { err "compiler-rt builtins build failed (see $BUILD_DIR/compiler-rt-build.log)"; return 1; }
+
+    mkdir -p "$CRT_DIR"
+    cp "$archive" "$CRT_DIR/libclang_rt.builtins.a"
+
+    # Cygwin's compiler-rt patch moves emutls.c into the shared builtins DLL and
+    # treats ___chkstk_ms as a cygwin1.dll/libgcc symbol, so neither is in the
+    # static archive. The cross toolchain has to provide them itself.
+    local tmp
+    tmp="$(mktemp -d /tmp/cygwin-builtins-XXXXXX)"
+    local src="$BUILD_DIR/llvm-project/compiler-rt/lib/builtins"
+    "$INSTALL_PREFIX/bin/clang" --target="$TRIPLE" --sysroot="$SYSROOT" -O2 \
+        -c "$src/emutls.c" -o "$tmp/emutls.o" ||
+        { err "building emutls.c failed"; rm -rf "$tmp"; return 1; }
+    "$INSTALL_PREFIX/bin/clang" --target="$TRIPLE" --sysroot="$SYSROOT" \
+        -c "$src/$ARCH/chkstk.S" -o "$tmp/chkstk.o" ||
+        { err "building chkstk.S failed"; rm -rf "$tmp"; return 1; }
+    "$INSTALL_PREFIX/bin/llvm-ar" rcs "$CRT_DIR/libclang_rt.builtins.a" \
+        "$tmp/emutls.o" "$tmp/chkstk.o"
+    rm -rf "$tmp"
+
+    info "compiler-rt builtins -> $CRT_DIR/libclang_rt.builtins.a"
+}
+
+# =============================================================================
 # Build libc++ / libc++abi / libunwind for Cygwin target
 # =============================================================================
 build_runtimes() {
@@ -402,12 +479,14 @@ LDDEOF
     # …-pc-windows-cygnus), so each triple gets a thin file that pins the
     # target and pulls in the flags shared by all Cygwin targets.
     #
-    # NOTE: no --rtlib=compiler-rt / --unwindlib=libunwind here — this
-    # toolchain does not build compiler-rt, and clang rejects
-    # unwindlib=libunwind while rtlib defaults to libgcc (Cygwin). Cygwin's
-    # static libgcc.a (kept in the sysroot) provides the runtime/unwind
-    # symbols; ld.lld links it without needing the gcc driver.
+    # Same set as llvm-mingw's mingw32-common.cfg: compiler-rt builtins for the
+    # runtime, libunwind for unwinding, libc++ for the C++ library. libunwind
+    # is only accepted once --rtlib=compiler-rt is in effect, and
+    # build_compiler_rt() ships the builtins (plus emutls/chkstk) in the
+    # resource dir. libgcc.a stays in the sysroot for GCC interop only.
     cat > "$BIN/cygwin-common.cfg" << 'CFGEOF'
+-rtlib=compiler-rt
+-unwindlib=libunwind
 -stdlib=libc++
 -fuse-ld=lld
 CFGEOF
@@ -636,6 +715,7 @@ if [ "$DO_BUILD" -eq 1 ]; then
     apply_patches
     build_llvm
     build_runtimes
+    build_compiler_rt
     post_install
     arrange_sysroot
     cleanup

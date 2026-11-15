@@ -102,9 +102,14 @@ wine-cygwin hello.exe
 ## 技术细节
 
 - **链接器**: Cygwin 补丁（`patches/clang/0104-*`）让 Cygwin 驱动直接调用 `ld.lld`，无需 GCC
-- **默认 C++ 标准库**: libc++（`toolchain/bin/` 里的 cfg 自动生效，参考 llvm-mingw 拆分：
-  `cygwin-common.cfg` 放公共 flag，`x86_64-pc-windows-cygnus.cfg` / `i686-pc-windows-cygnus.cfg`
-  用 `-target` + `@cygwin-common.cfg` 引入；`--target=…-pc-cygwin` 会被归一化成同一 triple）
+- **默认运行库**: 与 llvm-mingw 一致——`-rtlib=compiler-rt -unwindlib=libunwind
+  -stdlib=libc++ -fuse-ld=lld`（写在 `toolchain/bin/cygwin-common.cfg`，
+  `x86_64-pc-windows-cygnus.cfg` / `i686-pc-windows-cygnus.cfg` 用 `-target` +
+  `@cygwin-common.cfg` 引入）。compiler-rt 只编静态 builtins，装到
+  `lib/clang/23/lib/x86_64-pc-windows-cygnus/libclang_rt.builtins.a`，并额外塞入
+  `emutls.o`（`__emutls_get_address`）和 `chkstk.o`（`___chkstk_ms`）——Cygwin 的
+  compiler-rt 补丁把这两者放到 cygwin1.dll/共享 builtins 里，交叉编译拿不到。
+  `libgcc.a` 仍留在 sysroot 里只备用（`-rtlib=libgcc` 也能用）
 - **LDD**: 使用 `llvm-readobj --needed-libs` 实现 PE/COFF 依赖分析
 - **目录布局**: 参考 llvm-mingw，工具链与 sysroot 合并成一个根目录——头文件集中在
   `generic-pc-cygwin/include`，各 triple 目录的 `include` 是指向它的相对软链，
