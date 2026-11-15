@@ -31,8 +31,14 @@ PROJECT_DIR="$SCRIPT_DIR"
 
 PATCH_DIR="$PROJECT_DIR/patches"
 INSTALL_PREFIX="$PROJECT_DIR/toolchain"
-SYSROOT="$PROJECT_DIR/sysroot"
+# llvm-mingw-style single root: the Cygwin headers/libs live *inside* the
+# toolchain tree (generic-pc-cygwin/, x86_64-pc-cygwin/, ...) instead of a
+# separate sysroot/ directory, so the whole thing ships as one folder.
+SYSROOT="$INSTALL_PREFIX"
 BUILD_DIR="$PROJECT_DIR/build"
+# Baked into the driver as the default sysroot and resolved relative to
+# <root>/bin, so the tree stays relocatable: <root>/bin/.. == <root>.
+DEFAULT_SYSROOT=".."
 # Default parallelism: every installed CPU (nproc --all ignores affinity
 # masks / cgroup limits). Lower it on memory-limited hosts: JOBS=8 ./build.sh
 NPROC="$(nproc --all 2>/dev/null || echo 4)"
@@ -69,7 +75,7 @@ check_prereqs() {
     fi
     info "All build tools found."
 
-    if [ ! -d "$SYSROOT/usr/include" ]; then
+    if [ ! -d "$SYSROOT/usr/include" ] && [ ! -d "$SYSROOT/generic-pc-cygwin/include" ]; then
         err "Sysroot not found at $SYSROOT"
         err "Run: ./scripts/fetch-sysroot.sh"
         exit 1
@@ -97,8 +103,13 @@ clone_llvm() {
         fi
         info "Existing checkout is $have, want llvmorg-${LLVM_VERSION}: recloning"
         rm -rf llvm-project
-        # Build caches and the patch stamp belong to the old version too.
-        rm -rf llvm-build runtime-build "$BUILD_DIR/.patches-applied" "$INSTALL_PREFIX"
+        # Build caches and the patch stamp belong to the old version too. The
+        # install root also holds the Cygwin headers/libs now, so only the
+        # LLVM-owned subdirectories are removed.
+        rm -rf llvm-build runtime-build "$BUILD_DIR/.patches-applied" \
+               "$INSTALL_PREFIX/bin" "$INSTALL_PREFIX/lib" \
+               "$INSTALL_PREFIX/share" "$INSTALL_PREFIX/include" \
+               "$INSTALL_PREFIX/libexec"
     fi
 
     if [ -n "$PROXY" ]; then
@@ -176,7 +187,7 @@ apply_patches() {
             echo "    $pname -> skipped (already applied or does not match LLVM ${LLVM_VERSION})"
             skipped=$((skipped + 1))
         fi
-    done < <(find "$PATCH_DIR" -name '*.patch' -print0 2>/dev/null)
+    done < <(find "$PATCH_DIR" -name '*.patch' -print0 2>/dev/null | sort -z)
 
     echo ""
     info "Patches: $total total, $applied applied, $skipped skipped"
@@ -195,13 +206,27 @@ build_llvm() {
 
     cd "$BUILD_DIR"
 
-    if [ -f llvm-build/CMakeCache.txt ] && [ "$FORCE_RECONF" -eq 0 ]; then
-        info "llvm-build already configured; resuming (use --clean to reconfigure)"
+    local NEED_CONF=0
+    if [ ! -f llvm-build/CMakeCache.txt ]; then
+        NEED_CONF=1
+    elif [ "$FORCE_RECONF" -eq 1 ]; then
+        info "--clean: wiping llvm-build for a fresh configure"
+        rm -rf llvm-build
+        NEED_CONF=1
+    elif ! grep -qxF "DEFAULT_SYSROOT:STRING=${DEFAULT_SYSROOT}" llvm-build/CMakeCache.txt; then
+        info "llvm-build was configured for a different default sysroot; reconfiguring in place..."
+        NEED_CONF=1
     else
-        if [ "$FORCE_RECONF" -eq 1 ]; then
-            info "--clean: wiping llvm-build for a fresh configure"
-        fi
-        rm -rf llvm-build "$INSTALL_PREFIX"
+        info "llvm-build already configured; resuming (use --clean to reconfigure)"
+    fi
+
+    if [ "$NEED_CONF" -eq 1 ]; then
+        # Only the LLVM-owned subdirectories are wiped: this is also the root
+        # that holds the Cygwin headers/libs (generic-pc-cygwin/, <triple>/,
+        # usr/), which must survive a reconfigure.
+        rm -rf "$INSTALL_PREFIX/bin" "$INSTALL_PREFIX/lib" \
+               "$INSTALL_PREFIX/share" "$INSTALL_PREFIX/include" \
+               "$INSTALL_PREFIX/libexec"
 
         cmake -G Ninja \
             -S llvm-project/llvm \
@@ -214,7 +239,7 @@ build_llvm() {
             -DLLVM_ENABLE_ASSERTIONS=OFF \
             -DLLVM_OPTIMIZED_TABLEGEN=ON \
             -DLLVM_DEFAULT_TARGET_TRIPLE=x86_64-pc-windows-cygnus \
-            -DDEFAULT_SYSROOT="$SYSROOT" \
+            -DDEFAULT_SYSROOT="$DEFAULT_SYSROOT" \
             -DLLVM_ENABLE_THREADS=ON \
             -DLLVM_ENABLE_LLD=ON \
             -DCLANG_DEFAULT_LINKER=lld
@@ -236,17 +261,20 @@ build_runtimes() {
     local RT_BUILD="$BUILD_DIR/runtime-build"
     local RT_CONF_OK=0
 
-    # Resume-friendly configure: only (re)configure when needed. Cygwin needs
-    # RUNTIMES_USE_LIBC=newlib so libc++ takes the newlib ctype rune table in
-    # <__locale>, and LIBCXXABI_HAS_CXA_THREAD_ATEXIT_IMPL must stay off (see
-    # the configure call below); if an older cache lacks either, reconfigure in
-    # place (object files are kept, so this is cheap).
+    # Resume-friendly configure: only (re)configure when needed. The cache must
+    # match the current root (CMAKE_SYSROOT / install prefix) and the Cygwin
+    # requirements: RUNTIMES_USE_LIBC=newlib so libc++ takes the newlib ctype
+    # rune table in <__locale>, and LIBCXXABI_HAS_CXA_THREAD_ATEXIT_IMPL off
+    # (see the configure call below). Object files are kept, so reconfiguring
+    # in place is cheap.
     if [ -f "$RT_BUILD/CMakeCache.txt" ]; then
-        if grep -q '^RUNTIMES_USE_LIBC:STRING=newlib$' "$RT_BUILD/CMakeCache.txt" &&
+        if grep -qxF "CMAKE_SYSROOT:PATH=$SYSROOT" "$RT_BUILD/CMakeCache.txt" &&
+           grep -qxF "CMAKE_INSTALL_PREFIX:PATH=$SYSROOT/$TRIPLE" "$RT_BUILD/CMakeCache.txt" &&
+           grep -q '^RUNTIMES_USE_LIBC:STRING=newlib$' "$RT_BUILD/CMakeCache.txt" &&
            ! grep -qE '^LIBCXXABI_HAS_CXA_THREAD_ATEXIT_IMPL:[A-Z]+=(1|ON|TRUE|YES)$' "$RT_BUILD/CMakeCache.txt"; then
             RT_CONF_OK=1
         else
-            info "runtime-build cache needs reconfiguring (LIBC newlib / thread_local atexit); doing it in place..."
+            info "runtime-build cache needs reconfiguring (root paths / LIBC newlib / thread_local atexit); doing it in place..."
         fi
     fi
     if [ "$FORCE_RECONF" -eq 1 ]; then
@@ -265,6 +293,8 @@ set(CMAKE_CXX_COMPILER @CXX@)
 set(CMAKE_C_COMPILER_TARGET ${triple})
 set(CMAKE_CXX_COMPILER_TARGET ${triple})
 set(CMAKE_SYSROOT @SYSROOT@)
+# llvm-mingw-style tree: headers/libs of the target live in <root>/<triple>
+set(CMAKE_FIND_ROOT_PATH @SYSROOT@/@TRIPLE@)
 
 set(CMAKE_FIND_ROOT_PATH_MODE_PROGRAM NEVER)
 set(CMAKE_FIND_ROOT_PATH_MODE_LIBRARY ONLY)
@@ -284,6 +314,7 @@ TCEOF
     sed -i "s|@CC@|$INSTALL_PREFIX/bin/clang|g"     "$BUILD_DIR/toolchain-cygwin.cmake"
     sed -i "s|@CXX@|$INSTALL_PREFIX/bin/clang++|g"   "$BUILD_DIR/toolchain-cygwin.cmake"
     sed -i "s|@SYSROOT@|$SYSROOT|g"                  "$BUILD_DIR/toolchain-cygwin.cmake"
+    sed -i "s|@TRIPLE@|$TRIPLE|g"                    "$BUILD_DIR/toolchain-cygwin.cmake"
 
     if [ "$RT_CONF_OK" -eq 0 ]; then
         info "Configuring runtime build..."
@@ -301,7 +332,7 @@ TCEOF
             -B "$RT_BUILD" \
             -DCMAKE_TOOLCHAIN_FILE="$BUILD_DIR/toolchain-cygwin.cmake" \
             -DCMAKE_BUILD_TYPE=Release \
-            -DCMAKE_INSTALL_PREFIX="$SYSROOT/usr" \
+            -DCMAKE_INSTALL_PREFIX="$SYSROOT/$TRIPLE" \
             -DLLVM_ENABLE_RUNTIMES="libcxx;libcxxabi;libunwind" \
             -DLLVM_DEFAULT_TARGET_TRIPLE="$TRIPLE" \
             -DRUNTIMES_USE_LIBC=newlib \
@@ -329,7 +360,7 @@ TCEOF
     # Drop the previously installed libc++ header tree first: headers are fully
     # owned by this install, and a stale one (e.g. libc++ 22 shipped a ctype.h
     # that 23 no longer has) makes the new <cctype> fail with #error.
-    rm -rf "$SYSROOT/usr/include/c++/v1"
+    rm -rf "$SYSROOT/$TRIPLE/include/c++/v1"
     ninja -C "$RT_BUILD" install
     info "libc++, libc++abi, libunwind installed to sysroot"
 }
@@ -365,17 +396,29 @@ done
 LDDEOF
     chmod +x "$BIN/$TRIPLE-ldd"
 
-    # --- cfg file for auto-detection ---
-    # Placed alongside clang; auto-loaded when x86_64-pc-cygwin-clang runs.
-    # NOTE: do NOT set --unwindlib=libunwind here — clang's driver rejects
-    # unwindlib=libunwind while rtlib defaults to libgcc (Cygwin), and this
-    # toolchain does not build compiler-rt. Cygwin's static libgcc.a (kept in
-    # the sysroot) provides the runtime/unwind symbols; ld.lld links it without
-    # needing the gcc driver.
-    cat > "$BIN/x86_64-pc-windows-cygnus.cfg" << 'CFGEOF'
---stdlib=libc++
+    # --- default flags, laid out like llvm-mingw ---
+    # clang auto-loads <triple>.cfg from this directory, where <triple> is the
+    # driver's target triple (--target=…-cygwin normalizes to
+    # …-pc-windows-cygnus), so each triple gets a thin file that pins the
+    # target and pulls in the flags shared by all Cygwin targets.
+    #
+    # NOTE: no --rtlib=compiler-rt / --unwindlib=libunwind here — this
+    # toolchain does not build compiler-rt, and clang rejects
+    # unwindlib=libunwind while rtlib defaults to libgcc (Cygwin). Cygwin's
+    # static libgcc.a (kept in the sysroot) provides the runtime/unwind
+    # symbols; ld.lld links it without needing the gcc driver.
+    cat > "$BIN/cygwin-common.cfg" << 'CFGEOF'
+-stdlib=libc++
 -fuse-ld=lld
 CFGEOF
+
+    local t
+    for t in x86_64-pc-windows-cygnus i686-pc-windows-cygnus; do
+        cat > "$BIN/$t.cfg" << CFGEOF
+-target $t
+@cygwin-common.cfg
+CFGEOF
+    done
 
     # --- Wine wrapper ---
     cp "$SCRIPT_DIR/scripts/wine-cygwin.sh" "$BIN/wine-cygwin" 2>/dev/null || true
@@ -385,10 +428,105 @@ CFGEOF
 }
 
 # =============================================================================
+# Step 8: arrange the sysroot the way llvm-mingw lays out its target trees
+# =============================================================================
+# clang's Cygwin driver only searches <sysroot>/usr/include, /usr/include/w32api
+# and /usr/lib (+ /usr/lib/w32api, /usr/lib/gcc/<triple>/<ver>), while
+# llvm-mingw keeps one shared header tree beside per-triple bin/lib/share dirs:
+#
+#   generic-pc-cygwin/include/          all headers (w32api/ and c++/v1 inside)
+#   x86_64-pc-cygwin/include   -> ../generic-pc-cygwin/include
+#   x86_64-pc-cygwin/{bin,lib,share}    the real payload
+#   i686-pc-cygwin/include     -> ../generic-pc-cygwin/include
+#   usr/{include,bin,lib,share}         compatibility symlinks for the driver
+#
+# All symlinks are relative, so the tarball stays relocatable. The function is
+# idempotent: real directories are moved into place once, then symlinked over.
+arrange_sysroot() {
+    step "Step 8: Arrange sysroot (llvm-mingw-style triple trees)"
+
+    local S="$SYSROOT"
+    local GEN="$S/generic-pc-cygwin"
+    local T="$S/$TRIPLE"
+    local T32="i686-pc-cygwin"
+    local part gccdir
+
+    mkdir -p "$GEN" "$T" "$S/$T32" "$S/share"
+
+    # --- one shared header tree ---
+    if [ -d "$S/usr/include" ] && [ ! -L "$S/usr/include" ]; then
+        rm -rf "$GEN/include"
+        mv "$S/usr/include" "$GEN/include"
+        info "  usr/include -> generic-pc-cygwin/include"
+    fi
+    # A previous run installed libc++ straight into <triple>/include; fold that
+    # into the shared tree before it is replaced by the symlink below.
+    if [ -d "$T/include" ] && [ ! -L "$T/include" ]; then
+        mkdir -p "$GEN/include"
+        cp -a "$T/include"/. "$GEN/include"/
+        rm -rf "$T/include"
+    fi
+    mkdir -p "$GEN/include"
+
+    # --- payload into the target tree (bin/lib, llvm-mingw style) ---
+    for part in bin lib; do
+        if [ -d "$S/usr/$part" ] && [ ! -L "$S/usr/$part" ]; then
+            rm -rf "$T/$part"
+            mv "$S/usr/$part" "$T/$part"
+            info "  usr/$part -> $TRIPLE/$part"
+        fi
+        mkdir -p "$T/$part"
+        rm -f "$S/usr/$part"
+    done
+
+    # --- flatten GCC's runtime directory into <triple>/lib ---
+    # The driver no longer relies on GCCInstallation (no usr/lib/gcc/...), so
+    # crt0.o/crtbegin.o/libgcc.a must sit next to the other libraries. GCC's
+    # private headers are dropped: clang ships its own in the resource dir.
+    for gccdir in "$T"/lib/gcc/*/*; do
+        [ -d "$gccdir" ] || continue
+        # GCC's private headers (omp.h, quadmath.h, gcov.h, ...) are merged into
+        # the shared tree without overwriting anything Cygwin already provides;
+        # clang's own headers in the resource dir are searched first anyway.
+        if [ -d "$gccdir/include" ]; then
+            mkdir -p "$GEN/include"
+            cp -an "$gccdir/include"/. "$GEN/include"/
+            rm -rf "$gccdir/include"
+        fi
+        cp -a "$gccdir"/. "$T/lib"/
+    done
+    rm -rf "$T/lib/gcc"
+
+    # --- runtime data shared by every target goes to the top-level share/ ---
+    if [ -d "$S/usr/share/cygwin" ]; then
+        rm -rf "$S/share/cygwin"
+        mv "$S/usr/share/cygwin" "$S/share/cygwin"
+        info "  usr/share/cygwin -> share/cygwin"
+    fi
+    rm -rf "$T/share" "$S/usr/share"
+
+    # --- per-triple headers are symlinks to the shared tree ---
+    ln -sfn "../generic-pc-cygwin/include" "$T/include"
+    ln -sfn "../generic-pc-cygwin/include" "$S/$T32/include"
+
+    # Only the runtime DLL is useful in the target bin/; c89, cc,
+    # cygserver-config, ... are host-side clutter.
+    find "$T/bin" -mindepth 1 -maxdepth 1 ! -name cygwin1.dll \
+        -exec rm -rf {} + 2>/dev/null || true
+
+    # No usr/ or etc/ compatibility layer: the patched driver searches
+    # <root>/<triple>/{include,lib} directly. etc/ only carries Cygwin's default
+    # config templates (cygserver.conf) for a running Cygwin system.
+    rm -rf "$S/usr" "$S/etc"
+
+    info "  Headers: $(find "$GEN/include" -mindepth 1 -maxdepth 1 | wc -l) entries in generic-pc-cygwin/include"
+}
+
+# =============================================================================
 # Clean up unnecessary files
 # =============================================================================
 cleanup() {
-    step "Step 8: Cleanup"
+    step "Step 9: Cleanup"
 
     # Remove GCC .exe from sysroot (we use Clang + ld.lld only)
     info "Removing .exe files from sysroot..."
@@ -412,11 +550,11 @@ cleanup() {
           lld-link ld64.lld wasm-ld \
           2>/dev/null || true
 
-    rm -rf "$INSTALL_PREFIX/libexec" \
-           "$INSTALL_PREFIX/share/scan-build" \
-           "$INSTALL_PREFIX/share/scan-view" \
-           "$INSTALL_PREFIX/share/opt-viewer" \
-           2>/dev/null || true
+    rm -rf "$INSTALL_PREFIX/libexec" 2>/dev/null || true
+
+    # NOTE: do not trim $INSTALL_PREFIX/share — scan-build/scan-view/opt-viewer
+    # are legitimate parts of the toolchain install. Only the sysroot gets its
+    # share/ reduced (see arrange_sysroot).
 
     info "Cleanup done"
 }
@@ -433,37 +571,14 @@ do_package() {
     rm -rf "$pkg_dir"
     mkdir -p "$pkg_dir"
 
-    cp -a "$INSTALL_PREFIX" "$pkg_dir/toolchain"
-    cp -a "$SYSROOT" "$pkg_dir/sysroot"
+    # Single llvm-mingw-style root: bin/, lib/clang/, share/ and the Cygwin
+    # trees (generic-pc-cygwin/, x86_64-pc-cygwin/, i686-pc-cygwin/) all live
+    # side by side, so there is no separate sysroot/ to point at.
+    cp -a "$INSTALL_PREFIX/." "$pkg_dir/"
 
-    # README
-    cat > "$pkg_dir/README.txt" << EOF
-llvm-cygwin ${LLVM_VERSION} — Cross-compiler for Cygwin (Pure LLVM)
-=====================================================================
-Linux host → Cygwin/Windows PE target
-
-Includes:
-  Clang ${LLVM_VERSION}  — C/C++ compiler with Cygwin driver patches
-  LLD ${LLVM_VERSION}    — COFF linker (no GCC needed)
-  libc++ + libc++abi + libunwind ${LLVM_VERSION} — default C++ stdlib
-  Cygwin sysroot — headers, libraries, w32api
-
-Usage:
-  source env.sh
-  x86_64-pc-cygwin-clang++ -static hello.cpp -o hello.exe
-
-Test with Wine:
-  wine-cygwin hello.exe
-EOF
-
-    # env setup
-    cat > "$pkg_dir/env.sh" << 'ENVEOF'
-#!/bin/bash
-TC="$(cd "$(dirname "$0")" && pwd)"
-export PATH="$TC/toolchain/bin:$PATH"
-echo "llvm-cygwin ready. Try: x86_64-pc-cygwin-clang++ -static test.cpp -o test.exe"
-ENVEOF
-    chmod +x "$pkg_dir/env.sh"
+    # Sole metadata file, exactly like llvm-mingw: the LLVM project license
+    # (Apache-2.0 WITH LLVM-exception). No README, no env script.
+    cp "$BUILD_DIR/llvm-project/LICENSE.TXT" "$pkg_dir/LICENSES.txt"
 
     # Package
     cd "$out_dir"
@@ -522,6 +637,7 @@ if [ "$DO_BUILD" -eq 1 ]; then
     build_llvm
     build_runtimes
     post_install
+    arrange_sysroot
     cleanup
 
     step "Build Complete!"

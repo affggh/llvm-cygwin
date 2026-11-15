@@ -20,9 +20,12 @@ if(NOT LLVM_CYGWIN_ROOT)
 endif()
 
 # --- Sysroot (Cygwin headers + libs) ---
+# The sysroot is the toolchain root itself (llvm-mingw layout): the Cygwin
+# headers and libraries live in <root>/generic-pc-cygwin/ and
+# <root>/x86_64-pc-cygwin/. Override CYGWIN_SYSROOT only for a separate sysroot.
 set(CYGWIN_SYSROOT "$ENV{CYGWIN_SYSROOT}" CACHE PATH "Cygwin sysroot path")
 if(NOT CYGWIN_SYSROOT)
-    message(FATAL_ERROR "Set CYGWIN_SYSROOT to the Cygwin sysroot, e.g. /opt/cygwin-sysroot")
+    set(CYGWIN_SYSROOT "${LLVM_CYGWIN_ROOT}")
 endif()
 
 set(CMAKE_SYSROOT "${CYGWIN_SYSROOT}")

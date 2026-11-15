@@ -1,0 +1,90 @@
+--- a/clang/lib/Driver/ToolChains/Cygwin.cpp
++++ b/clang/lib/Driver/ToolChains/Cygwin.cpp
+@@ -36,6 +36,17 @@
+ 
+   Generic_GCC::AddMultiarchPaths(D, SysRoot, "lib", Paths);
+ 
++  // llvm-mingw-style per-triple tree inside the sysroot:
++  //   <sysroot>/<triple>/{lib,lib/w32api}
++  // The tree uses the canonical <arch>-pc-cygwin spelling while the driver's
++  // own triple keeps the legacy <arch>-pc-windows-cygnus form, so accept both.
++  const std::string TripleNames[] = {getTriple().getArchName().str() + "-pc-cygwin",
++                                     getTriple().str()};
++  for (const std::string &Name : TripleNames) {
++    addPathIfExists(D, SysRoot + "/" + Name + "/lib", Paths);
++    addPathIfExists(D, SysRoot + "/" + Name + "/lib/w32api", Paths);
++  }
++
+   // Similar to the logic for GCC above, if we are currently running Clang
+   // inside of the requested system root, add its parent library path to those
+   // searched.
+@@ -102,6 +113,19 @@
+     addExternCSystemInclude(DriverArgs, CC1Args,
+                             SysRoot + "/usr/include/" + MultiarchIncludeDir);
+ 
++  // llvm-mingw-style per-triple tree: <sysroot>/<triple>/include carries the
++  // same headers as ../generic-pc-cygwin/include, so a separate usr/include
++  // compatibility layer is not needed.
++  const std::string TripleIncludeDirs[] = {
++      getTriple().getArchName().str() + "-pc-cygwin", getTriple().str()};
++  for (const std::string &Name : TripleIncludeDirs) {
++    std::string Dir = SysRoot + "/" + Name + "/include";
++    if (D.getVFS().exists(Dir)) {
++      addExternCSystemInclude(DriverArgs, CC1Args, Dir);
++      addExternCSystemInclude(DriverArgs, CC1Args, Dir + "/w32api");
++    }
++  }
++
+   // Add an include of '/include' directly. This isn't provided by default by
+   // system GCCs, but is often used with cross-compiling GCCs, and harmless to
+   // add even when Clang is acting as-if it were a system compiler.
+@@ -111,6 +135,27 @@
+   addExternCSystemInclude(DriverArgs, CC1Args, SysRoot + "/usr/include/w32api");
+ }
+ 
++void Cygwin::AddClangCXXStdlibIncludeArgs(const ArgList &DriverArgs,
++                                           ArgStringList &CC1Args) const {
++  ToolChain::AddClangCXXStdlibIncludeArgs(DriverArgs, CC1Args);
++
++  // libc++ headers live in the per-triple tree
++  // (<sysroot>/<triple>/include/c++/v1), not in <sysroot>/usr/include/c++/v1
++  // where CC1's default header search expects them.
++  if (DriverArgs.hasArg(options::OPT_nostdincxx) ||
++      GetCXXStdlibType(DriverArgs) != ToolChain::CST_Libcxx)
++    return;
++
++  const std::string SysRoot = computeSysRoot();
++  const std::string TripleNames[] = {getTriple().getArchName().str() + "-pc-cygwin",
++                                     getTriple().str()};
++  for (const std::string &Name : TripleNames) {
++    const std::string Dir = SysRoot + "/" + Name + "/include/c++/v1";
++    if (getDriver().getVFS().exists(Dir))
++      addSystemInclude(DriverArgs, CC1Args, Dir);
++  }
++}
++
+ void cygwin::Linker::ConstructJob(Compilation &C, const JobAction &JA,
+                                   const InputInfo &Output,
+                                   const InputInfoList &Inputs,
+--- a/clang/lib/Driver/ToolChains/Cygwin.h
++++ b/clang/lib/Driver/ToolChains/Cygwin.h
+@@ -24,10 +24,19 @@
+   llvm::ExceptionHandling
+   GetExceptionModel(const llvm::opt::ArgList &Args) const override;
+ 
++  // The toolchain links with ld.lld, which consumes LLVM bitcode natively.
++  // Without this, the driver refuses to hand -flto objects to the linker
++  // ("unable to pass LLVM bit-code files to linker").
++  bool HasNativeLLVMSupport() const override { return true; }
++
+   void
+   AddClangSystemIncludeArgs(const llvm::opt::ArgList &DriverArgs,
+                             llvm::opt::ArgStringList &CC1Args) const override;
+ 
++  void
++  AddClangCXXStdlibIncludeArgs(const llvm::opt::ArgList &DriverArgs,
++                               llvm::opt::ArgStringList &CC1Args) const override;
++
+ protected:
+   Tool *buildLinker() const override;
+ };

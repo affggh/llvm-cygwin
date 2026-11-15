@@ -3,11 +3,12 @@
 # fetch-sysroot.sh — Download Cygwin packages to create a cross-compile sysroot
 # =============================================================================
 # Downloads base Cygwin binary packages from a mirror and extracts headers,
-# libraries, and runtime files to create a sysroot for llvm-cygwin.
+# libraries, and runtime files into the toolchain root, which doubles as the
+# cross-compile sysroot (llvm-mingw layout).
 #
 # Usage:
-#   ./scripts/fetch-sysroot.sh                    # download to ./sysroot
-#   ./scripts/fetch-sysroot.sh /path/to/sysroot   # custom location
+#   ./scripts/fetch-sysroot.sh                    # download to ./toolchain
+#   ./scripts/fetch-sysroot.sh /path/to/root      # custom location
 #   CYGWIN_MIRROR=https://... ./scripts/fetch-sysroot.sh
 # =============================================================================
 
@@ -15,7 +16,9 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
-SYSROOT="${1:-$PROJECT_DIR/sysroot}"
+# The Cygwin headers/libs are downloaded straight into the toolchain root
+# (llvm-mingw layout), so there is a single directory to ship.
+SYSROOT="${1:-$PROJECT_DIR/toolchain}"
 
 CYGWIN_MIRROR="${CYGWIN_MIRROR:-https://mirrors.kernel.org/sourceware/cygwin}"
 ARCH="x86_64"
@@ -285,41 +288,6 @@ resolve_and_fetch() {
 post_process() {
     step "Step 3: Post-process sysroot"
 
-    local TRIPLE="x86_64-pc-cygwin"
-    local TRIPLE32="i686-pc-cygwin"
-
-    info "Creating $TRIPLE symlinks..."
-    mkdir -p "$SYSROOT/usr/$TRIPLE/include" "$SYSROOT/usr/$TRIPLE/lib"
-
-    if [ -d "$SYSROOT/usr/include" ]; then
-        for h in "$SYSROOT"/usr/include/*; do
-            [ -e "$h" ] || continue
-            ln -sf "../../../usr/include/$(basename "$h")" "$SYSROOT/usr/$TRIPLE/include/" 2>/dev/null || true
-        done
-    fi
-
-    if [ -d "$SYSROOT/usr/lib" ]; then
-        for l in "$SYSROOT"/usr/lib/*.a "$SYSROOT"/usr/lib/*.o; do
-            [ -e "$l" ] || continue
-            ln -sf "../../../usr/lib/$(basename "$l")" "$SYSROOT/usr/$TRIPLE/lib/" 2>/dev/null || true
-        done
-    fi
-
-    info "Creating $TRIPLE32 symlinks..."
-    mkdir -p "$SYSROOT/usr/$TRIPLE32/include" "$SYSROOT/usr/$TRIPLE32/lib"
-    if [ -d "$SYSROOT/usr/include" ]; then
-        for h in "$SYSROOT"/usr/include/*; do
-            [ -e "$h" ] || continue
-            ln -sf "../../../usr/include/$(basename "$h")" "$SYSROOT/usr/$TRIPLE32/include/" 2>/dev/null || true
-        done
-    fi
-    if [ -d "$SYSROOT/usr/lib" ]; then
-        for l in "$SYSROOT"/usr/lib/*.a "$SYSROOT"/usr/lib/*.o; do
-            [ -e "$l" ] || continue
-            ln -sf "../../../usr/lib/$(basename "$l")" "$SYSROOT/usr/$TRIPLE32/lib/" 2>/dev/null || true
-        done
-    fi
-
     # Report cygwin1.dll location
     if [ -f "$SYSROOT/usr/bin/cygwin1.dll" ]; then
         info "cygwin1.dll: $SYSROOT/usr/bin/cygwin1.dll"
@@ -333,8 +301,14 @@ post_process() {
     info "Removing .exe files (not needed on Linux)..."
     find "$SYSROOT" -name "*.exe" -type f -delete 2>/dev/null || true
     rm -rf "$SYSROOT/usr/sbin" 2>/dev/null || true
+    # Cygwin's default config templates (etc/defaults/etc/cygserver.conf) only
+    # matter on a running Cygwin system, not for cross-compiling.
+    rm -rf "$SYSROOT/etc" 2>/dev/null || true
 
-    # Summary
+    # The llvm-mingw-style layout (generic-pc-cygwin/include + per-triple
+    # bin/lib/share) is produced by build.sh, which is what consumes the
+    # sysroot. Reporting paths through usr/ keeps this working for both
+    # layouts, since build.sh leaves usr/ as symlinks.
     echo ""
     info "Sysroot summary for $SYSROOT:"
     echo "  Headers  : $(find "$SYSROOT/usr/include" -maxdepth 1 -type d 2>/dev/null | wc -l) directories"

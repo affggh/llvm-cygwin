@@ -10,8 +10,6 @@ LLVM/Clang/LLD 交叉编译工具链，目标为 **Cygwin** (x86_64-pc-cygwin)�
 ```
 llvm-cygwin/
 ├── build.sh                     # 一键构建脚本
-├── config/clang/
-│   └── x86_64-pc-cygwin.cfg     # Clang 配置文件
 ├── cmake/
 │   └── x86_64-pc-cygwin.cmake   # CMake 工具链文件（用户项目使用）
 ├── scripts/
@@ -20,9 +18,14 @@ llvm-cygwin/
 │   └── wine-cygwin.sh           # Wine 测试 wrapper
 ├── patches/custom/              # 自定义补丁（唯一需要版本控制的补丁）
 │   ├── 0001-coff-reload-automatic-imports-after-lto.patch
-│   └── 0002-mingw-backport-push-state.patch
-├── sysroot/                     # (gitignored) Cygwin 头文件和库
-├── toolchain/                   # (gitignored) 编译产物
+│   └── 0003-cygwin-per-triple-tree.patch
+├── toolchain/                   # (gitignored) 唯一的产物根目录（= sysroot，llvm-mingw 式）
+│   ├── bin/                         # clang、ld.lld、x86_64-pc-cygwin-* 包装器、*.cfg
+│   ├── lib/clang/23/                # resource dir
+│   ├── share/                       # clang、man、scan-build、scan-view、opt-viewer、cygwin/
+│   ├── generic-pc-cygwin/include/   # 全部 Cygwin/w32api/libc++ 头文件
+│   ├── x86_64-pc-cygwin/            # include 软链、bin/cygwin1.dll、lib/
+│   └── i686-pc-cygwin/include       # -> ../generic-pc-cygwin/include
 └── build/                       # (gitignored) 构建目录
 ```
 
@@ -34,7 +37,7 @@ llvm-cygwin/
 ./scripts/fetch-patches.sh
 ```
 
-### 2. 下载 Cygwin sysroot
+### 2. 下载 Cygwin sysroot（解压进 toolchain 根目录）
 
 ```bash
 ./scripts/fetch-sysroot.sh
@@ -52,7 +55,7 @@ llvm-cygwin/
 `build/llvm-build`、`build/runtime-build`，而是直接 `ninja` 增量续建，几分钟即可
 继续。只有主动传 `--clean` 或删除相应目录才会重新 configure。
 
-构建完成后，工具链在 `toolchain/`，sysroot 在 `sysroot/`。
+构建完成后一切都在这一个 `toolchain/` 目录里（工具链 + sysroot 合并，可直接整目录打包/拷贝）。
 
 ### 4. 使用
 
@@ -92,15 +95,26 @@ wine-cygwin hello.exe
 # 自动查找 cygwin1.dll 并用 Wine 运行
 ./scripts/wine-cygwin.sh hello.exe
 
-# 指定 sysroot
-./scripts/wine-cygwin.sh --sysroot=./sysroot myapp.exe arg1 arg2
+# 指定根目录（默认自动找 ./toolchain）
+./scripts/wine-cygwin.sh --sysroot=./toolchain myapp.exe arg1 arg2
 ```
 
 ## 技术细节
 
 - **链接器**: Cygwin 补丁（`patches/clang/0104-*`）让 Cygwin 驱动直接调用 `ld.lld`，无需 GCC
-- **默认 C++ 标准库**: libc++（通过 `x86_64-pc-windows-cygnus.cfg` 自动配置）
+- **默认 C++ 标准库**: libc++（`toolchain/bin/` 里的 cfg 自动生效，参考 llvm-mingw 拆分：
+  `cygwin-common.cfg` 放公共 flag，`x86_64-pc-windows-cygnus.cfg` / `i686-pc-windows-cygnus.cfg`
+  用 `-target` + `@cygwin-common.cfg` 引入；`--target=…-pc-cygwin` 会被归一化成同一 triple）
 - **LDD**: 使用 `llvm-readobj --needed-libs` 实现 PE/COFF 依赖分析
+- **目录布局**: 参考 llvm-mingw，工具链与 sysroot 合并成一个根目录——头文件集中在
+  `generic-pc-cygwin/include`，各 triple 目录的 `include` 是指向它的相对软链，
+  `bin`/`lib` 放在 triple 目录里，Cygwin 的运行时数据（`cygwin.ldif`）并入顶层
+  `share/cygwin`。目标树里**没有** `usr/`、`etc/`：clang 的 Cygwin 驱动由
+  `patches/custom/0003-cygwin-per-triple-tree.patch` 改成直接搜索
+  `<root>/<triple>/{include,include/w32api,lib,lib/w32api}` 和
+  `<root>/<triple>/include/c++/v1`（libc++），GCC 运行时目录（crt*.o、libgcc.a）被摊平进
+  `<root>/<triple>/lib`，其私有头（omp.h、quadmath.h 等）以不覆盖的方式并入共享头目录。
+  默认 sysroot 编译成相对路径 `..`（相对 `<root>/bin`），因此整个目录可搬移
 - **TLS**: `__thread` / `thread_local` 走 emulated TLS（Cygwin 驱动强制 `-femulated-tls`），
   POD 和带构造/析构的类型都可用（`__cxa_thread_atexit` 由打过补丁的 libc++abi 提供）。
   产物里没有原生 PE TLS 目录，且 emutls 状态是每个 DLL 各一份——跨 DLL 访问同一个 TLS

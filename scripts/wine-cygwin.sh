@@ -9,11 +9,12 @@
 #   ./scripts/wine-cygwin.sh hello.exe
 #   ./scripts/wine-cygwin.sh --sysroot=./sysroot test.exe arg1 arg2
 #
-# The script auto-detects the sysroot by checking, in order:
+# The script auto-detects cygwin1.dll by checking, in order:
 #   1. --sysroot= argument
 #   2. $CYGWIN_SYSROOT environment variable
-#   3. ./sysroot (relative to project root)
-#   4. ./toolchain/x86_64-pc-cygwin
+#   3. ./toolchain (merged llvm-mingw-style root)
+#   4. ./sysroot (legacy separate sysroot)
+#   5. any cygwin1.dll within 3 levels of the project root
 # =============================================================================
 
 set -euo pipefail
@@ -64,14 +65,15 @@ find_cygwin1() {
         search_paths+=("$CYGWIN_SYSROOT/bin/cygwin1.dll")
     fi
 
-    # 3. Project sysroot
+    # 3. Merged toolchain root (toolchain is the sysroot)
+    search_paths+=("$PROJECT_DIR/toolchain/x86_64-pc-cygwin/bin/cygwin1.dll")
+    search_paths+=("$PROJECT_DIR/toolchain/x86_64-pc-cygwin/lib/cygwin1.dll")
+    search_paths+=("$PROJECT_DIR/toolchain/usr/bin/cygwin1.dll")
+
+    # 4. Legacy separate sysroot
     search_paths+=("$PROJECT_DIR/sysroot/usr/bin/cygwin1.dll")
     search_paths+=("$PROJECT_DIR/sysroot/usr/lib/cygwin1.dll")
     search_paths+=("$PROJECT_DIR/sysroot/bin/cygwin1.dll")
-
-    # 4. Toolchain sysroot
-    search_paths+=("$PROJECT_DIR/toolchain/x86_64-pc-cygwin/bin/cygwin1.dll")
-    search_paths+=("$PROJECT_DIR/toolchain/x86_64-pc-cygwin/lib/cygwin1.dll")
 
     # 5. Generic search within 3 levels
     while IFS= read -r -d '' dll; do
