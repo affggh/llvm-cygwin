@@ -72,7 +72,7 @@ wine-cygwin hello.exe
 
 | 变量 | 默认值 | 说明 |
 |---|---|---|
-| `JOBS` | `min(nproc, 8)` | 并行编译任务数；WSL/内存受限主机默认封顶 8，可用 `JOBS=16` 覆盖 |
+| `JOBS` | `nproc --all` | 并行编译任务数；默认用满所有 CPU，内存受限主机可用 `JOBS=8 ./build.sh` 降低 |
 | `PROXY` | `http://127.0.0.1:7897` | HTTP 代理 |
 | `CYGWIN_MIRROR` | `mirrors.kernel.org` | Cygwin 镜像地址 |
 | `SKIP_CLONE` | 空 | 设为 1 跳过 LLVM clone（开发用） |

@@ -19,7 +19,7 @@
 #   3. ./build.sh
 #
 # Environment:
-#   JOBS         Parallel build jobs (default: min(nproc, 8); WSL-safe)
+#   JOBS         Parallel build jobs (default: nproc --all)
 #   PROXY        HTTP proxy (default: http://127.0.0.1:7897)
 #   SKIP_CLONE   Skip LLVM clone step (for dev iteration)
 # =============================================================================
@@ -33,18 +33,16 @@ PATCH_DIR="$PROJECT_DIR/patches"
 INSTALL_PREFIX="$PROJECT_DIR/toolchain"
 SYSROOT="$PROJECT_DIR/sysroot"
 BUILD_DIR="$PROJECT_DIR/build"
-# Cap the default parallelism at 8 so WSL / memory-limited hosts don't OOM.
-# Override on beefy hosts with JOBS=N, e.g.  JOBS=32 ./build.sh
-NPROC="$(nproc 2>/dev/null || echo 4)"
-DEFAULT_JOBS=8
-[ "$NPROC" -lt "$DEFAULT_JOBS" ] && DEFAULT_JOBS="$NPROC"
-JOBS="${JOBS:-$DEFAULT_JOBS}"
+# Default parallelism: every installed CPU (nproc --all ignores affinity
+# masks / cgroup limits). Lower it on memory-limited hosts: JOBS=8 ./build.sh
+NPROC="$(nproc --all 2>/dev/null || echo 4)"
+JOBS="${JOBS:-$NPROC}"
 LLVM_VERSION="22.1.8"
 # PROXY: set to empty string to disable (e.g. in CI)
 PROXY=""
 
 TRIPLE="x86_64-pc-cygwin"
-GCCVER=13
+GCCVER=14
 
 PACKAGE_NAME="llvm-cygwin-${LLVM_VERSION}-x86_64-linux"
 PACKAGE_FILE="${PACKAGE_NAME}.tar.xz"
@@ -476,7 +474,7 @@ for arg in "$@"; do
             echo "re-run everything from scratch after an interruption."
             echo ""
             echo "Environment:"
-            echo "  JOBS             Parallel jobs (default: min(nproc,8))"
+            echo "  JOBS             Parallel jobs (default: nproc --all)"
             echo "  PROXY            HTTP proxy (default: http://127.0.0.1:7897)"
             echo "  SKIP_CLONE=1     Skip LLVM clone step (for dev iteration)"
             exit 0

@@ -127,11 +127,16 @@ download_setup_ini() {
         local url="${CYGWIN_MIRROR}/${ARCH}/setup.bz2"
         info "Fetching setup.bz2 ..."
         if download "$url" "${ini}.bz2"; then
-            bzcat "${ini}.bz2" > "$ini" 2>/dev/null
-            rm -f "${ini}.bz2"
-            info "setup.bz2: OK ($(wc -c < "$ini") bytes)"
-            return 0
+            # A truncated download or an HTML error page must not abort the
+            # script (set -e): report it and fall through to the next format.
+            if bzcat "${ini}.bz2" > "$ini" 2>/dev/null; then
+                rm -f "${ini}.bz2"
+                info "setup.bz2: OK ($(wc -c < "$ini") bytes)"
+                return 0
+            fi
+            info "setup.bz2: decompression failed, trying next format"
         fi
+        rm -f "${ini}.bz2"
     fi
 
     # Try setup.zst
@@ -139,11 +144,14 @@ download_setup_ini() {
         local url="${CYGWIN_MIRROR}/${ARCH}/setup.zst"
         info "Fetching setup.zst ..."
         if download "$url" "${ini}.zst"; then
-            zstd -dc "${ini}.zst" > "$ini" 2>/dev/null
-            rm -f "${ini}.zst"
-            info "setup.zst: OK ($(wc -c < "$ini") bytes)"
-            return 0
+            if zstd -dc "${ini}.zst" > "$ini" 2>/dev/null; then
+                rm -f "${ini}.zst"
+                info "setup.zst: OK ($(wc -c < "$ini") bytes)"
+                return 0
+            fi
+            info "setup.zst: decompression failed, trying next format"
         fi
+        rm -f "${ini}.zst"
     fi
 
     # Try uncompressed setup.ini
@@ -331,7 +339,7 @@ post_process() {
     info "Sysroot summary for $SYSROOT:"
     echo "  Headers  : $(find "$SYSROOT/usr/include" -maxdepth 1 -type d 2>/dev/null | wc -l) directories"
     echo "  Libraries: $(find "$SYSROOT/usr/lib" -name '*.a' -o -name '*.o' 2>/dev/null | wc -l) files"
-    DLL=$(find "$SYSROOT" -name cygwin1.dll -type f 2>/dev/null | head -1)
+    DLL="$(find "$SYSROOT" -name cygwin1.dll -type f 2>/dev/null | head -1 || true)"
     [ -n "$DLL" ] && echo "  cygwin1.dll: $DLL" || echo "  cygwin1.dll: NOT FOUND"
 }
 

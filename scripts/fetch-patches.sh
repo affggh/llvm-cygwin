@@ -102,11 +102,16 @@ download_setup_ini() {
         local url="${CYGWIN_MIRROR}/${ARCH}/setup.bz2"
         info "Fetching setup.bz2 ..."
         if download "$url" "${ini}.bz2"; then
-            bzcat "${ini}.bz2" > "$ini" 2>/dev/null
-            rm -f "${ini}.bz2"
-            info "setup.bz2: OK ($(wc -c < "$ini") bytes)"
-            return 0
+            # A truncated download or an HTML error page must not abort the
+            # script (set -e): report it and fall through to the next format.
+            if bzcat "${ini}.bz2" > "$ini" 2>/dev/null; then
+                rm -f "${ini}.bz2"
+                info "setup.bz2: OK ($(wc -c < "$ini") bytes)"
+                return 0
+            fi
+            info "setup.bz2: decompression failed, trying next format"
         fi
+        rm -f "${ini}.bz2"
     fi
 
     # Try setup.zst
@@ -114,11 +119,14 @@ download_setup_ini() {
         local url="${CYGWIN_MIRROR}/${ARCH}/setup.zst"
         info "Fetching setup.zst ..."
         if download "$url" "${ini}.zst"; then
-            zstd -dc "${ini}.zst" > "$ini" 2>/dev/null
-            rm -f "${ini}.zst"
-            info "setup.zst: OK ($(wc -c < "$ini") bytes)"
-            return 0
+            if zstd -dc "${ini}.zst" > "$ini" 2>/dev/null; then
+                rm -f "${ini}.zst"
+                info "setup.zst: OK ($(wc -c < "$ini") bytes)"
+                return 0
+            fi
+            info "setup.zst: decompression failed, trying next format"
         fi
+        rm -f "${ini}.zst"
     fi
 
     # Try uncompressed setup.ini
@@ -338,11 +346,12 @@ for src_path in "${!SRC_TO_DIRS[@]}"; do
 done
 
 step "Summary"
-# Count total patch files across all directories
-TOTAL_PATCHES="$(find "$PATCHES_DIR"/llvm "$PATCHES_DIR"/clang "$PATCHES_DIR"/lld \
-    "$PATCHES_DIR"/compiler-rt "$PATCHES_DIR"/libcxx "$PATCHES_DIR"/libcxxabi \
-    "$PATCHES_DIR"/libunwind \
-    -maxdepth 1 -name '*.patch' -type f 2>/dev/null | wc -l)"
+# Count total patch files recursively (matches how build.sh consumes them).
+# Guard against a missing PATCHES_DIR: find would fail and, under pipefail,
+# abort the script before printing anything.
+if [ -d "$PATCHES_DIR" ]; then
+    TOTAL_PATCHES="$(find "$PATCHES_DIR" -name '*.patch' -type f 2>/dev/null | wc -l || true)"
+fi
 info "Total patch files: $TOTAL_PATCHES"
 info "Patches directory: $PATCHES_DIR/"
 
