@@ -238,13 +238,15 @@ build_runtimes() {
 
     # Resume-friendly configure: only (re)configure when needed. Cygwin needs
     # RUNTIMES_USE_LIBC=newlib so libc++ takes the newlib ctype rune table in
-    # <__locale>; if an older cache lacks this we reconfigure it in place
-    # (object files are kept, so this is cheap).
+    # <__locale>, and LIBCXXABI_HAS_CXA_THREAD_ATEXIT_IMPL must stay off (see
+    # the configure call below); if an older cache lacks either, reconfigure in
+    # place (object files are kept, so this is cheap).
     if [ -f "$RT_BUILD/CMakeCache.txt" ]; then
-        if grep -q '^RUNTIMES_USE_LIBC:STRING=newlib$' "$RT_BUILD/CMakeCache.txt"; then
+        if grep -q '^RUNTIMES_USE_LIBC:STRING=newlib$' "$RT_BUILD/CMakeCache.txt" &&
+           ! grep -qE '^LIBCXXABI_HAS_CXA_THREAD_ATEXIT_IMPL:[A-Z]+=(1|ON|TRUE|YES)$' "$RT_BUILD/CMakeCache.txt"; then
             RT_CONF_OK=1
         else
-            info "runtime-build cache lacks RUNTIMES_USE_LIBC=newlib; reconfiguring in place..."
+            info "runtime-build cache needs reconfiguring (LIBC newlib / thread_local atexit); doing it in place..."
         fi
     fi
     if [ "$FORCE_RECONF" -eq 1 ]; then
@@ -285,6 +287,15 @@ TCEOF
 
     if [ "$RT_CONF_OK" -eq 0 ]; then
         info "Configuring runtime build..."
+        # LIBCXXABI_HAS_CXA_THREAD_ATEXIT_IMPL=OFF is required: the CMake probe
+        # (check_library_exists) cannot link while cross-compiling
+        # (CMAKE_TRY_COMPILE_TARGET_TYPE=STATIC_LIBRARY), so it always reports
+        # the symbol as present even though cygwin1.dll does not export
+        # __cxa_thread_atexit_impl. Left on, libc++abi compiles
+        # __cxa_thread_atexit() as a call through Cygwin's deliberately NULL
+        # impl pointer, which the optimizer turns into a trap — every
+        # non-trivially-constructed thread_local then aborts on first access.
+        # With it off, libc++abi uses its own DtorsManager path instead.
         cmake -G Ninja \
             -S "$BUILD_DIR/llvm-project/runtimes" \
             -B "$RT_BUILD" \
@@ -294,6 +305,7 @@ TCEOF
             -DLLVM_ENABLE_RUNTIMES="libcxx;libcxxabi;libunwind" \
             -DLLVM_DEFAULT_TARGET_TRIPLE="$TRIPLE" \
             -DRUNTIMES_USE_LIBC=newlib \
+            -DLIBCXXABI_HAS_CXA_THREAD_ATEXIT_IMPL=OFF \
             -DLIBCXX_ENABLE_STATIC=ON \
             -DLIBCXX_ENABLE_SHARED=OFF \
             -DLIBCXX_ENABLE_STATIC_ABI_LIBRARY=ON \

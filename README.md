@@ -101,6 +101,10 @@ wine-cygwin hello.exe
 - **链接器**: Cygwin 补丁（`patches/clang/0104-*`）让 Cygwin 驱动直接调用 `ld.lld`，无需 GCC
 - **默认 C++ 标准库**: libc++（通过 `x86_64-pc-windows-cygnus.cfg` 自动配置）
 - **LDD**: 使用 `llvm-readobj --needed-libs` 实现 PE/COFF 依赖分析
+- **TLS**: `__thread` / `thread_local` 走 emulated TLS（Cygwin 驱动强制 `-femulated-tls`），
+  POD 和带构造/析构的类型都可用（`__cxa_thread_atexit` 由打过补丁的 libc++abi 提供）。
+  产物里没有原生 PE TLS 目录，且 emutls 状态是每个 DLL 各一份——跨 DLL 访问同一个 TLS
+  变量会得到不同地址，需要共享时请用 `pthread_getspecific` 之类的显式接口
 - **补丁来源**: Cygwin 官方源码包（https://cygwin.com/git/cygwin-packages/）
 
 ## 要求
