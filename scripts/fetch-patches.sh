@@ -2,12 +2,13 @@
 # =============================================================================
 # fetch-patches.sh — Download Cygwin LLVM/Clang/LLD patches via setup.ini
 # =============================================================================
-# Fetches setup.ini from a Cygwin mirror, resolves the source package paths
-# (and versions) for LLVM/Clang/LLD/compiler-rt/libc++/libc++abi/libunwind,
-# downloads the -src.tar.xz archives, and extracts .patch files into patches/.
+# Fetches setup.ini from a Cygwin mirror, resolves the source packages for the
+# LLVM release build.sh builds (same major, newest available), downloads the
+# -src.tar.xz archives, and extracts .patch files into patches/.
 #
 # Usage:
 #   ./scripts/fetch-patches.sh
+#   LLVM_VERSION=23.1.1 ./scripts/fetch-patches.sh
 #   CYGWIN_MIRROR=https://... ./scripts/fetch-patches.sh
 # =============================================================================
 
@@ -19,6 +20,12 @@ PATCHES_DIR="$PROJECT_DIR/patches"
 
 CYGWIN_MIRROR="${CYGWIN_MIRROR:-https://mirrors.kernel.org/sourceware/cygwin}"
 ARCH="x86_64"
+
+# Target LLVM version whose sources get patched: take it from build.sh so the
+# fetched patches always match the tree it compiles. Override with
+# LLVM_VERSION=23.1.1 ./scripts/fetch-patches.sh
+LLVM_VERSION="${LLVM_VERSION:-$(sed -n 's/^LLVM_VERSION="\(.*\)"$/\1/p' "$PROJECT_DIR/build.sh" 2>/dev/null | head -1)}"
+LLVM_MAJOR="${LLVM_VERSION%%.*}"
 
 # Respect proxy from environment
 export http_proxy="${http_proxy:-${HTTP_PROXY:-}}"
@@ -143,26 +150,63 @@ download_setup_ini() {
 }
 
 # =============================================================================
-# Parse a field from a package's section in setup.ini
-#   $1 = field name (e.g. "source:", "version:", "install:")
-#   $2 = package name
-#   $3 = path to setup.ini
+# List "version source-path" pairs for a package section of setup.ini.
+# Cygwin lists several versions per package (current, [test], [prev]); the
+# "source:" line always belongs to the "version:" line above it.
+#   $1 = package name
+#   $2 = path to setup.ini
 # =============================================================================
-parse_field() {
-    local field="$1"
-    local pkg="$2"
-    local ini="$3"
+list_pkg_versions() {
+    local pkg="$1"
+    local ini="$2"
 
-    awk -v pkg="@ $pkg" -v field="$field" '
-        $0 == pkg { found=1; next }
-        found && /^@ /   { exit }
-        found && /^\[/   { exit }
-        found && index($0, field) == 1 {
-            sub("^" field "[ \t]*", "")
-            print $1
-            exit
-        }
+    awk -v pkg="@ $pkg" '
+        $0 == pkg { found = 1; version = ""; next }
+        found && /^@ / { exit }
+        found && /^version:/ { version = $2; next }
+        found && /^source:/ && version != "" { print version, $2; version = "" }
     ' "$ini"
+}
+
+# =============================================================================
+# Pick the setup.ini version/source pair that matches the LLVM version we
+# build: an exact version first, otherwise the newest one with the same major
+# (Cygwin usually lags a patch release behind upstream, e.g. it ships 23.1.0
+# while upstream already has 23.1.1).
+# Echoes a single "version source-path" line, or nothing if unavailable.
+#   $1 = package name
+#   $2 = path to setup.ini
+#   $3 = wanted version (e.g. 23.1.1, may be empty)
+#   $4 = wanted major (e.g. 23, may be empty)
+# =============================================================================
+select_pkg_version() {
+    local pkg="$1"
+    local ini="$2"
+    local want="${3:-}"
+    local want_major="${4:-}"
+
+    local pairs
+    pairs="$(list_pkg_versions "$pkg" "$ini")"
+    [ -n "$pairs" ] || return 0
+
+    local selected=""
+    if [ -n "$want" ]; then
+        # "23.1.0-1" → "23.1.0"; Cygwin appends its own -N release suffix.
+        selected="$(printf '%s\n' "$pairs" \
+            | awk -v w="$want" '{ v = $1; sub(/-[0-9]+$/, "", v); if (v == w) { print; exit } }')"
+    fi
+    if [ -z "$selected" ] && [ -n "$want_major" ]; then
+        selected="$(printf '%s\n' "$pairs" \
+            | awk -v m="$want_major" '{ split($1, v, "."); if (v[1] == m) print }' \
+            | sort -V -k1,1 | tail -1)"
+    fi
+    if [ -z "$selected" ] && [ -z "$want" ] && [ -z "$want_major" ]; then
+        # No target version known: fall back to the newest on the mirror.
+        selected="$(printf '%s\n' "$pairs" | sort -V -k1,1 | tail -1)"
+    fi
+
+    [ -n "$selected" ] && printf '%s\n' "$selected"
+    return 0
 }
 
 # =============================================================================
@@ -215,17 +259,41 @@ fetch_source_pkg() {
     # Copy all .patch files into each target directory
     local total_patches=0
     local patch_list=()
+    local patch_names=()
     while IFS= read -r -d '' f; do
         patch_list+=("$f")
+        patch_names+=("$(basename "$f")")
         total_patches=$((total_patches + 1))
     done < <(find "$tmpdir" -name "*.patch" -print0 2>/dev/null)
 
     for dir in $target_dirs; do
-        mkdir -p "$PATCHES_DIR/$dir"
+        local target="$PATCHES_DIR/$dir"
+        local manifest="$target/.fetched-patches"
+        mkdir -p "$target"
+
+        # Drop patches a previous run fetched that this version no longer
+        # ships (e.g. one merged upstream). Only files this script created are
+        # tracked in the manifest, so hand-written patches stay untouched.
+        if [ -f "$manifest" ] && [ "$total_patches" -gt 0 ]; then
+            local stale
+            while IFS= read -r stale; do
+                [ -n "$stale" ] || continue
+                [ -f "$target/$stale" ] || continue
+                if ! printf '%s\n' "${patch_names[@]}" | grep -qxF -- "$stale"; then
+                    rm -f "$target/$stale"
+                    info "  removed stale patch: $dir/$stale"
+                fi
+            done < "$manifest"
+        fi
+
         for f in "${patch_list[@]:-}"; do
             [ -f "$f" ] || continue
-            cp "$f" "$PATCHES_DIR/$dir/"
+            cp "$f" "$target/"
         done
+
+        if [ "$total_patches" -gt 0 ]; then
+            printf '%s\n' "${patch_names[@]}" > "$manifest"
+        fi
     done
 
     info "  $total_patches patch file(s) → $target_dirs"
@@ -247,6 +315,7 @@ Options:
   --help, -h        Show this help
 
 Environment:
+  LLVM_VERSION      LLVM version to patch (default: LLVM_VERSION from build.sh)
   CYGWIN_MIRROR     Cygwin mirror base URL (default: mirrors.kernel.org)
   http_proxy / https_proxy   Proxy for downloads
 EOF
@@ -273,10 +342,7 @@ download_setup_ini "$INI"
 
 step "Step 2: Resolve source packages from setup.ini"
 
-# Determine target major version from the llvm package
-LLVM_PKG_VER="$(parse_field "version:" "llvm" "$INI")"
-LLVM_MAJOR="${LLVM_PKG_VER%%.*}"
-info "  LLVM version from setup.ini: $LLVM_PKG_VER (major: $LLVM_MAJOR)"
+info "  Target LLVM version: $LLVM_VERSION (major: ${LLVM_MAJOR:-any})"
 
 # Map: source_path → space-separated list of patch dirs
 # (multiple packages may share the same source tarball)
@@ -295,20 +361,19 @@ for entry in "${PATCH_PKGS[@]}"; do
         continue
     fi
 
-    version="$(parse_field "version:" "$pkg_name" "$INI")"
-    src_path="$(parse_field "source:" "$pkg_name" "$INI")"
-
-    if [ -z "$src_path" ]; then
-        err "No 'source:' field for $pkg_name in setup.ini"
-        FAILURES=$((FAILURES + 1))
+    selected="$(select_pkg_version "$pkg_name" "$INI" "$LLVM_VERSION" "$LLVM_MAJOR")"
+    if [ -z "$selected" ]; then
+        # e.g. libc++abi1 only has ancient 8.0.1 — no longer packaged separately
+        info "  $local_dir: skipping $pkg_name (no ${LLVM_MAJOR:-matching} source package)"
         continue
     fi
 
-    # Skip packages whose major version doesn't match LLVM
-    # (e.g. libc++abi1 only has ancient 8.0.1 — no longer packaged separately)
-    pkg_major="${version%%.*}"
-    if [ -n "$LLVM_MAJOR" ] && [ "$pkg_major" != "$LLVM_MAJOR" ]; then
-        info "  $local_dir: skipping $pkg_name $version (major $pkg_major != $LLVM_MAJOR)"
+    version="${selected%% *}"
+    src_path="${selected#* }"
+
+    if [ -z "$src_path" ]; then
+        err "No 'source:' field for $pkg_name $version in setup.ini"
+        FAILURES=$((FAILURES + 1))
         continue
     fi
 

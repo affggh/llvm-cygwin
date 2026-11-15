@@ -1,0 +1,85 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: llvm-cygwin <dev@llvm-cygwin.local>
+Date: Sun, 15 Nov 2026 15:50:00 +0800
+Subject: [PATCH] [lld][MinGW] Backport --push-state/--pop-state
+
+These options were only added to the MinGW driver in LLVM 23 (see
+lld/MinGW/Options.td upstream).  CMake relies on them for
+$<LINK_LIBRARY:WHOLE_ARCHIVE,...>: it probes `ld --help` for the flags and,
+since the generic lld binary reports the ELF driver's help text, it
+concludes that push/pop state is supported and emits
+
+  -Xlinker --push-state -Xlinker --whole-archive ... -Xlinker --pop-state
+
+When the Cygwin target links a PE image that ends up in the MinGW driver,
+LLD 22 rejects the arguments with
+
+  lld: error: unknown argument: --push-state
+  lld: error: unknown argument: --pop-state
+
+and every executable fails to link.  Carrying the upstream implementation
+avoids the mismatch for this toolchain, which CMake cannot probe correctly
+for a multi-flavor linker.
+
+This is a straight backport of the LLVM 23 code, no behaviour change for
+other option combinations.
+
+Signed-off-by: llvm-cygwin <dev@llvm-cygwin.local>
+diff --git a/lld/MinGW/Driver.cpp b/lld/MinGW/Driver.cpp
+index 70639573b..513320d95 100644
+--- a/lld/MinGW/Driver.cpp
++++ b/lld/MinGW/Driver.cpp
+@@ -44,6 +44,7 @@
+ #include "llvm/TargetParser/Host.h"
+ #include "llvm/TargetParser/Triple.h"
+ #include <optional>
++#include <stack>
+ 
+ using namespace lld;
+ using namespace llvm::opt;
+@@ -570,6 +571,11 @@ bool link(ArrayRef<const char *> argsArr, llvm::raw_ostream &stdoutOS,
+ 
+   StringRef prefix = "";
+   bool isStatic = false;
++  struct PushPopState {
++    StringRef prefix;
++    bool isStatic;
++  };
++  std::stack<PushPopState, std::vector<PushPopState>> pushPopStates;
+   for (auto *a : args) {
+     switch (a->getOption().getID()) {
+     case OPT_INPUT:
+@@ -594,6 +600,18 @@ bool link(ArrayRef<const char *> argsArr, llvm::raw_ostream &stdoutOS,
+     case OPT_Bdynamic:
+       isStatic = false;
+       break;
++    case OPT_push_state:
++      pushPopStates.push({prefix, isStatic});
++      break;
++    case OPT_pop_state:
++      if (pushPopStates.empty()) {
++        error("unbalanced --push-state/--pop-state");
++        break;
++      }
++      prefix = pushPopStates.top().prefix;
++      isStatic = pushPopStates.top().isStatic;
++      pushPopStates.pop();
++      break;
+     }
+   }
+ 
+diff --git a/lld/MinGW/Options.td b/lld/MinGW/Options.td
+index 66643be56..bd6bf2022 100644
+--- a/lld/MinGW/Options.td
++++ b/lld/MinGW/Options.td
+@@ -125,6 +125,10 @@ def o: JoinedOrSeparate<["-"], "o">, MetaVarName<"<path>">,
+   HelpText<"Path to file to write output">;
+ defm out_implib: Eq<"out-implib", "Import library name">;
+ defm output_def: Eq<"output-def", "Output def file">;
++def pop_state: F<"pop-state">,
++  HelpText<"Restore the states saved by --push-state">;
++def push_state: F<"push-state">,
++  HelpText<"Save the current state of --Bstatic/--Bdynamic and --whole-archive">;
+ defm reloc_section: B_enable_disable<"reloc-section",
+      "Enable base relocations", "Disable base relocations">;
+ defm section_alignment: Eq<"section-alignment", "Set section alignment">;

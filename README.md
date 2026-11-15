@@ -19,7 +19,9 @@ llvm-cygwin/
 │   ├── fetch-sysroot.sh         # 下载并创建 Cygwin sysroot
 │   └── wine-cygwin.sh           # Wine 测试 wrapper
 ├── patches/custom/              # 自定义补丁（唯一需要版本控制的补丁）
-│   └── 0001-cygwin-direct-lld-linker.patch
+│   ├── 0001-coff-reload-automatic-imports-after-lto.patch
+│   ├── 0001-cygwin-direct-lld-linker.patch
+│   └── 0002-mingw-backport-push-state.patch
 ├── sysroot/                     # (gitignored) Cygwin 头文件和库
 ├── toolchain/                   # (gitignored) 编译产物
 └── build/                       # (gitignored) 构建目录
@@ -76,6 +78,11 @@ wine-cygwin hello.exe
 | `PROXY` | `http://127.0.0.1:7897` | HTTP 代理 |
 | `CYGWIN_MIRROR` | `mirrors.kernel.org` | Cygwin 镜像地址 |
 | `SKIP_CLONE` | 空 | 设为 1 跳过 LLVM clone（开发用） |
+
+> **升级 LLVM 版本**：只需改 `build.sh` 里的 `LLVM_VERSION`（当前 `23.1.1`），
+> 然后重新运行 `./scripts/fetch-patches.sh`（默认按该版本从 Cygwin 取补丁）
+> 和 `./build.sh`。`build.sh` 检测到 `build/llvm-project` 是别的 tag 时会自动
+> 重新 clone，并清掉旧的 build 缓存和补丁标记。
 
 > **注意**：libiconv / libintl 的二进制包现在已整合到 `fetch-sysroot.sh` 中，
 > 随 sysroot 一起直接下载，不再需要手动编译。

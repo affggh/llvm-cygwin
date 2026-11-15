@@ -1,0 +1,49 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: llvm-cygwin <dev@llvm-cygwin.local>
+Date: Sun, 15 Nov 2026 15:40:00 +0800
+Subject: [PATCH] [lld][COFF] Load automatic imports again after LTO codegen
+
+MinGW automatic imports are prepared by loadMinGWSymbols(), which pulls in
+the lazy __imp_<sym> archive member of every undefined <sym>, and that pass
+only runs once, before compileBitcodeFiles().
+
+LTO codegen can introduce undefined symbols that did not exist during that
+pass, because clang only emits them while compiling the merged bitcode.
+For imported data clang does not reference <sym> directly, but emits a
+.refptr.<sym> chunk which the linker later rewires to the import address
+table.  As the corresponding __imp_<sym> stub is still a lazy archive
+symbol at that point, handleMinGWAutomaticImport() finds no Defined symbol
+for it and the reference is reported as undefined.
+
+This is the normal case on Cygwin, where the stack protector guard is
+imported from cygwin1.dll instead of being defined locally as on MinGW: with
+LTO enabled any program instrumented by -fstack-protector fails to link:
+
+  ld.lld: error: undefined symbol: __stack_chk_guard
+  >>> referenced by prog.exe.lto.obj:(.refptr.__stack_chk_guard)
+
+Run the automatic import pass once more after the post-LTO run() so that the
+stubs introduced by codegen get loaded as well.
+
+Signed-off-by: llvm-cygwin <dev@llvm-cygwin.local>
+diff --git a/lld/COFF/Driver.cpp b/lld/COFF/Driver.cpp
+index ec1875638..5c088ddb0 100644
+--- a/lld/COFF/Driver.cpp
++++ b/lld/COFF/Driver.cpp
+@@ -2775,6 +2775,16 @@ void LinkerDriver::linkerMain(ArrayRef<const char *> argsArr) {
+   // references to the symbols we use from them.
+   run();
+ 
++  // LTO codegen can introduce undefined symbols that were not present when
++  // the automatic import pass ran above.  Clang emits such a reference for
++  // imported data, e.g. .refptr.__stack_chk_guard for the Cygwin runtime,
++  // and the matching __imp_ stub is still a lazy archive symbol here, so
++  // run the import pass again to pull it in.
++  if (config->autoImport || config->stdcallFixup) {
++    ctx.forEachSymtab([](SymbolTable &symtab) { symtab.loadMinGWSymbols(); });
++    run();
++  }
++
+   // Apply symbol renames for -wrap.
+   ctx.forEachSymtab([](SymbolTable &symtab) {
+     if (!symtab.wrapped.empty())

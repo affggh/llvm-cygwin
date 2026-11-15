@@ -59,6 +59,14 @@ jobs:
           gcc --version | head -1
           python3 --version
 
+      - name: Resolve LLVM version
+        id: llvm_version
+        working-directory: llvm-cygwin
+        run: |
+          version="$(sed -n 's/^LLVM_VERSION="\(.*\)"$/\1/p' build.sh | head -1)"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "LLVM version: $version"
+
       - name: Download Cygwin patches
         working-directory: llvm-cygwin
         run: bash scripts/fetch-patches.sh
@@ -101,7 +109,7 @@ jobs:
             Pure-LLVM cross-compiler for **Linux → Cygwin/Windows PE** targets.
 
             ### Included
-            - Clang/LLD/libc++/libc++abi/libunwind (LLVM 20.1.8)
+            - Clang/LLD/libc++/libc++abi/libunwind (LLVM ${{ steps.llvm_version.outputs.version }})
             - Cygwin sysroot (headers, libraries, w32api, libiconv, libintl)
 
             ### Usage

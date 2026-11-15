@@ -37,7 +37,7 @@ BUILD_DIR="$PROJECT_DIR/build"
 # masks / cgroup limits). Lower it on memory-limited hosts: JOBS=8 ./build.sh
 NPROC="$(nproc --all 2>/dev/null || echo 4)"
 JOBS="${JOBS:-$NPROC}"
-LLVM_VERSION="22.1.8"
+LLVM_VERSION="23.1.1"
 # PROXY: set to empty string to disable (e.g. in CI)
 PROXY=""
 
@@ -86,10 +86,19 @@ clone_llvm() {
     cd "$BUILD_DIR"
 
     if [ -d llvm-project ]; then
-        # Resume-friendly: reuse an existing checkout. Delete it manually
-        # (rm -rf build/llvm-project) to force a fresh clone.
-        info "Using existing llvm-project (delete it to force a fresh clone)"
-        return
+        # Resume-friendly: reuse an existing checkout, but only if it is the
+        # tag we build — otherwise the stale sources would silently be patched
+        # and compiled under the new version number.
+        local have
+        have="$(git -C llvm-project describe --tags --exact-match 2>/dev/null || echo unknown)"
+        if [ "$have" = "llvmorg-${LLVM_VERSION}" ]; then
+            info "Using existing llvm-project ($have; delete it to force a fresh clone)"
+            return
+        fi
+        info "Existing checkout is $have, want llvmorg-${LLVM_VERSION}: recloning"
+        rm -rf llvm-project
+        # Build caches and the patch stamp belong to the old version too.
+        rm -rf llvm-build runtime-build "$BUILD_DIR/.patches-applied" "$INSTALL_PREFIX"
     fi
 
     if [ -n "$PROXY" ]; then
@@ -305,6 +314,10 @@ TCEOF
     fi
 
     ninja -C "$RT_BUILD" -j"$JOBS" cxx cxxabi unwind
+    # Drop the previously installed libc++ header tree first: headers are fully
+    # owned by this install, and a stale one (e.g. libc++ 22 shipped a ctype.h
+    # that 23 no longer has) makes the new <cctype> fail with #error.
+    rm -rf "$SYSROOT/usr/include/c++/v1"
     ninja -C "$RT_BUILD" install
     info "libc++, libc++abi, libunwind installed to sysroot"
 }
