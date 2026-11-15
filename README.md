@@ -20,7 +20,6 @@ llvm-cygwin/
 │   └── wine-cygwin.sh           # Wine 测试 wrapper
 ├── patches/custom/              # 自定义补丁（唯一需要版本控制的补丁）
 │   ├── 0001-coff-reload-automatic-imports-after-lto.patch
-│   ├── 0001-cygwin-direct-lld-linker.patch
 │   └── 0002-mingw-backport-push-state.patch
 ├── sysroot/                     # (gitignored) Cygwin 头文件和库
 ├── toolchain/                   # (gitignored) 编译产物
@@ -99,7 +98,7 @@ wine-cygwin hello.exe
 
 ## 技术细节
 
-- **链接器**: 通过自定义 patch（`patches/custom/`），Cygwin 驱动直接调用 `ld.lld`，无需 GCC
+- **链接器**: Cygwin 补丁（`patches/clang/0104-*`）让 Cygwin 驱动直接调用 `ld.lld`，无需 GCC
 - **默认 C++ 标准库**: libc++（通过 `x86_64-pc-windows-cygnus.cfg` 自动配置）
 - **LDD**: 使用 `llvm-readobj --needed-libs` 实现 PE/COFF 依赖分析
 - **补丁来源**: Cygwin 官方源码包（https://cygwin.com/git/cygwin-packages/）
