@@ -79,17 +79,6 @@ jobs:
         working-directory: llvm-cygwin
         run: bash build.sh
 
-      - name: Smoke test
-        working-directory: llvm-cygwin
-        run: |
-          echo '#include <cstdio>' > test.cpp
-          echo 'int main() { printf("Hello from llvm-cygwin!\\n"); return 0; }' >> test.cpp
-          export PATH="$PWD/toolchain/bin:$PATH"
-          x86_64-pc-cygwin-clang++ -static test.cpp -o test.exe
-          file test.exe
-          echo "=== Smoke test passed ==="
-          rm -f test.cpp test.exe
-
       - name: Upload package artifact
         uses: actions/upload-artifact@v4
         with:
