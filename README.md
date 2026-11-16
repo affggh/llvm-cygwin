@@ -110,6 +110,10 @@ wine-cygwin hello.exe
   `emutls.o`（`__emutls_get_address`）和 `chkstk.o`（`___chkstk_ms`）——Cygwin 的
   compiler-rt 补丁把这两者放到 cygwin1.dll/共享 builtins 里，交叉编译拿不到。
   `libgcc.a` 仍留在 sysroot 里只备用（`-rtlib=libgcc` 也能用）
+- **无宿主依赖**: 编译时固定 `-DLLVM_ENABLE_LIBXML2=OFF`，产出的二进制不再链接宿主
+  的 `libxml2.so`，CI 也不需要 `libxml2-dev`（不同 Ubuntu 版本的 libxml2/clang 包差异
+  不会再导致配置或运行失败）。代价是不再提供 `llvm-mt`（`lld/COFF` 里的 manifest
+  合并退化为 stub）；需要它时去掉该 flag 并装上 `libxml2-dev` 重编即可
 - **LDD**: 使用 `llvm-readobj --needed-libs` 实现 PE/COFF 依赖分析
 - **目录布局**: 参考 llvm-mingw，工具链与 sysroot 合并成一个根目录——头文件集中在
   `generic-pc-cygwin/include`，各 triple 目录的 `include` 是指向它的相对软链，

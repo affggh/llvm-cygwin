@@ -36,6 +36,11 @@ jobs:
         with:
           path: llvm-cygwin
 
+      # Only what build.sh itself needs. Deliberately no libxml2-dev / host
+      # clang / llvm / lld: the toolchain is configured with
+      # -DLLVM_ENABLE_LIBXML2=OFF and builds its own compilers, so the result
+      # no longer depends on which Ubuntu image (22.04 vs 24.04, differing
+      # libxml2/clang package versions) the runner happens to use.
       - name: Install system dependencies
         run: |
           sudo apt-get update -qq
@@ -44,20 +49,18 @@ jobs:
             ninja-build \
             git \
             wget \
+            patch \
             gcc \
             g++ \
             xz-utils \
             zstd \
-            bzip2 \
-            pkg-config \
-            libxml2-dev \
-            python3 clang llvm lld
+            bzip2
           echo "=== Tool versions ==="
           cmake --version | head -1
           ninja --version
           git --version
           gcc --version | head -1
-          python3 --version
+          patch --version | head -1
 
       - name: Resolve LLVM version
         id: llvm_version
@@ -78,6 +81,22 @@ jobs:
       - name: Build toolchain
         working-directory: llvm-cygwin
         run: bash build.sh
+
+      - name: Verify bundled runtime libraries
+        working-directory: llvm-cygwin
+        run: |
+          set -e
+          for f in \
+            toolchain/x86_64-pc-cygwin/lib/libc++.a \
+            toolchain/x86_64-pc-cygwin/lib/libc++abi.a \
+            toolchain/x86_64-pc-cygwin/lib/libunwind.a \
+            toolchain/lib/clang/*/lib/*/libclang_rt.builtins.a; do
+            test -f "$f" || { echo "ERROR: missing $f"; exit 1; }
+            echo "OK: $f"
+          done
+          # The packaged tree must be the single llvm-mingw-style root.
+          test -d toolchain/generic-pc-cygwin/include
+          test -x toolchain/bin/x86_64-pc-cygwin-clang++
 
       - name: Upload package artifact
         uses: actions/upload-artifact@v4

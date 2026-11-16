@@ -216,6 +216,9 @@ build_llvm() {
     elif ! grep -qxF "DEFAULT_SYSROOT:STRING=${DEFAULT_SYSROOT}" llvm-build/CMakeCache.txt; then
         info "llvm-build was configured for a different default sysroot; reconfiguring in place..."
         NEED_CONF=1
+    elif ! grep -qxF "LLVM_ENABLE_LIBXML2:STRING=OFF" llvm-build/CMakeCache.txt; then
+        info "llvm-build was configured with libxml2; reconfiguring without it..."
+        NEED_CONF=1
     else
         info "llvm-build already configured; resuming (use --clean to reconfigure)"
     fi
@@ -242,6 +245,7 @@ build_llvm() {
             -DDEFAULT_SYSROOT="$DEFAULT_SYSROOT" \
             -DLLVM_ENABLE_THREADS=ON \
             -DLLVM_ENABLE_LLD=ON \
+            -DLLVM_ENABLE_LIBXML2=OFF \
             -DCLANG_DEFAULT_LINKER=lld
     fi
 
@@ -548,14 +552,20 @@ arrange_sysroot() {
     mkdir -p "$GEN/include"
 
     # --- payload into the target tree (bin/lib, llvm-mingw style) ---
+    # Merge, never replace: build_runtimes() has already installed
+    # libc++/libc++abi/libunwind into <triple>/lib and build_compiler_rt() puts
+    # the builtins in the resource dir, so moving usr/lib over the top would
+    # delete them (a fresh build then shipped without libunwind; only
+    # incremental builds that had already migrated usr/ kept it). Cygwin's
+    # files are copied in without clobbering anything already there.
     for part in bin lib; do
         if [ -d "$S/usr/$part" ] && [ ! -L "$S/usr/$part" ]; then
-            rm -rf "$T/$part"
-            mv "$S/usr/$part" "$T/$part"
+            mkdir -p "$T/$part"
+            cp -a "$S/usr/$part"/. "$T/$part"/
             info "  usr/$part -> $TRIPLE/$part"
         fi
         mkdir -p "$T/$part"
-        rm -f "$S/usr/$part"
+        rm -rf "$S/usr/$part"
     done
 
     # --- flatten GCC's runtime directory into <triple>/lib ---
@@ -564,12 +574,20 @@ arrange_sysroot() {
     # private headers are dropped: clang ships its own in the resource dir.
     for gccdir in "$T"/lib/gcc/*/*; do
         [ -d "$gccdir" ] || continue
+        rm -rf "$gccdir/install-tools"
         # GCC's private headers (omp.h, quadmath.h, gcov.h, ...) are merged into
         # the shared tree without overwriting anything Cygwin already provides;
         # clang's own headers in the resource dir are searched first anyway.
         if [ -d "$gccdir/include" ]; then
             mkdir -p "$GEN/include"
-            cp -an "$gccdir/include"/. "$GEN/include"/
+            # Copy only what is missing: Cygwin's own headers (limits.h,
+            # stdint.h, ...) must win over GCC's.
+            local h
+            for h in "$gccdir/include"/*; do
+                [ -e "$h" ] || continue
+                [ -e "$GEN/include/$(basename "$h")" ] ||
+                    cp -a "$h" "$GEN/include/"
+            done
             rm -rf "$gccdir/include"
         fi
         cp -a "$gccdir"/. "$T/lib"/
@@ -598,6 +616,19 @@ arrange_sysroot() {
     # config templates (cygserver.conf) for a running Cygwin system.
     rm -rf "$S/usr" "$S/etc"
 
+    # Sanity check: these are produced by build_runtimes() into <triple>/lib
+    # before this function runs, so losing them here means the layout step is
+    # broken (a fresh build then silently ships without libc++/libunwind).
+    local f missing=0
+    for f in libc++.a libc++abi.a libunwind.a; do
+        [ -f "$T/lib/$f" ] || { err "  missing runtime library: $TRIPLE/lib/$f"; missing=1; }
+    done
+    [ "$missing" -eq 0 ] || {
+        err "sysroot layout dropped the C++ runtime libraries"
+        exit 1
+    }
+
+    info "  Runtime : $(ls "$T/lib"/libc++*.a "$T/lib"/libunwind*.a 2>/dev/null | xargs -r -n1 basename | tr '\n' ' ')"
     info "  Headers: $(find "$GEN/include" -mindepth 1 -maxdepth 1 | wc -l) entries in generic-pc-cygwin/include"
 }
 
